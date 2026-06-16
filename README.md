@@ -1,9 +1,13 @@
 # coder-crew
 
-A **local-first agentic coding crew**. You give it a goal; a *manager* model plans
-it into subtasks, *worker* models implement each one with real tools (file + shell)
-gated behind your approval, every subtask is checked by a **runnable acceptance
-gate**, and the manager reviews and integrates the result into a final answer.
+> **A local-first agentic coding crew that codes what it can and is honest about
+> what it can't** — every subtask is gated on a runnable test, and unverified work
+> is never counted as passed.
+
+You give it a goal; a *manager* model plans it into subtasks, *worker* models
+implement each one with real tools (file + shell) gated behind your approval, every
+subtask is checked by a **runnable acceptance gate**, and the manager reviews and
+integrates the result into a final answer.
 
 It runs entirely on local models via [Ollama](https://ollama.com). An **optional,
 opt-in auto-router** can escalate a subtask that local can't finish (or can't
@@ -15,6 +19,22 @@ manager (plan) ──► worker · worker · worker ──► manager (review + 
                       └─ each subtask: implement → run its acceptance gate → repair (≤3) 
 ```
 
+## What it does — and doesn't — guarantee
+
+Honesty about the boundary is the whole point:
+
+- **Catches:** failed gates; **missing tests** (the completeness check flags a
+  module shipped without a test that actually ran — counted `unverified`, not
+  passed); and — with a **Claude/Opus manager** — many **incomplete-test gaps**
+  (the coverage review critiques tests against the spec and can turn an
+  omitted-case bug into a caught `failed`).
+- **Does NOT guarantee that a passing test suite is COMPLETE.** A green gate proves
+  the tests *pass*, not that they *cover the spec* — test completeness is undecidable
+  in general. The coverage review **reduces** this gap (with an Opus manager) but
+  cannot eliminate it; pure-local runs rely on the gate plus **your own review**.
+  This is the honest boundary, and it's the differentiator — unverified work is
+  surfaced as `unverified`/`failed`, never dressed up as a pass.
+
 ## Why it's different
 
 - **Acceptance-gated, not vibes.** Every subtask carries a runnable check
@@ -22,6 +42,15 @@ manager (plan) ──► worker · worker · worker ──► manager (review + 
   Checks that just prove code "imports/runs" are rejected — they verify nothing.
 - **Honest accounting.** Manual-review / unverifiable subtasks are tracked as
   `unverified`, never silently counted as passed.
+- **Completeness check.** A subtask that shipped a deliverable (e.g. a module)
+  with no test that actually ran is flagged `unverified` — and a local retry first
+  tries to write the missing test before giving up honestly.
+- **Spec-coverage review** *(Claude/Opus manager; default ON only there)*. After a
+  subtask is green, the manager critiques its tests against the spec; missing spec
+  cases trigger a local retry that adds them — and if an added test then fails, the
+  subtask becomes `failed` and **names the real bug** (an incomplete-test bug caught
+  instead of shipped). Best-effort, conservative, degrades to a no-op with a weak/
+  local manager; never fabricates a failure or fakes a pass.
 - **Disjoint file ownership.** The planner assigns each subtask the exact files it
   may write; the tools refuse writes outside that set, so parallel-decomposed work
   doesn't clobber itself.
@@ -83,9 +112,33 @@ Roles are pluggable agent specs:
 - `claude:<model>` — e.g. `claude:claude-opus-4-8` (a real Claude Code session via
   the Agent SDK; needs `claude-agent-sdk` + a logged-in `claude` CLI)
 
-A common setup is a **Claude/Opus manager** (the strongest planner/reviewer) with a
-**local worker** doing the building — or all-local for zero cost. On a single GPU,
-workers run sequentially; the win is decomposition + verification quality.
+Pick the config honestly for what you need:
+
+- **All-local** (e.g. `qwen3-coder:30b` for both) — free, private, no API. You get
+  gating + the completeness check, but the **weakest verification**: no spec-coverage
+  review (it's a no-op for a local manager), so test *completeness* is on you.
+- **Opus manager + local worker** *(recommended)* — Opus plans/reviews and runs the
+  **spec-coverage review** (catches many incomplete-test gaps); the local model does
+  the building (cheap). Best verification per dollar.
+- **Opus for both** — strongest, priciest.
+
+`coverage_review` defaults **ON only when the manager is a Claude spec** (a local
+manager's critique is too weak to be worth the latency). On a single GPU, workers
+run sequentially; the win is decomposition + verification quality, not throughput.
+
+### Connecting Claude (optional)
+
+The **Connection** panel in the UI controls the optional Claude path:
+
+- **Off** — local-only; Claude isn't used or offered.
+- **Claude Code** — uses your logged-in `claude` CLI (Claude Code subscription).
+- **API key** — set the **`CLAUDE_API_KEY`** environment variable (preferred), or
+  paste a key in the UI. A pasted key is saved to `config.json` **in plaintext**
+  (git-ignored — **never commit or share it**). Either source is exported as
+  `ANTHROPIC_API_KEY` for the SDK/CLI; the env var wins if both are set.
+
+Hit **🛰 Test connection** to do a real one-word round-trip and confirm it actually
+works before you rely on it. Either way you need `pip install claude-agent-sdk`.
 
 ## Security
 
@@ -99,6 +152,10 @@ arbitrary command.
 The optional unattended auto-approve mode runs file writes and shell commands
 **without review** — using it trades the approval gate for autonomy, so only point
 it at work (and a folder) you trust.
+
+**API keys:** prefer the `CLAUDE_API_KEY` environment variable. A key entered in the
+UI is stored **in plaintext** in `config.json` (git-ignored) — never commit or share
+that file. "Claude Code" mode and "Off" store no key.
 
 ## License
 

@@ -10,6 +10,11 @@ crew_history.db
 crew-workspace/
 *.log
 
+# PyInstaller build artifacts (the exe is shipped as a release asset, not committed)
+dist/
+build/
+*.spec
+
 # local config (may hold tokens / machine-specific paths / MCP server env)
 config.json
 

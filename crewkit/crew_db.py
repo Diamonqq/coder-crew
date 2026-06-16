@@ -12,10 +12,14 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import sys
 import threading
 from pathlib import Path
 
-_DEFAULT = Path(__file__).resolve().parent.parent / "crew_history.db"
+# Writable: beside the exe when frozen, else the repo root. ($CREW_DB overrides.)
+_BASE = (Path(sys.executable).parent if getattr(sys, "frozen", False)
+         else Path(__file__).resolve().parent.parent)
+_DEFAULT = _BASE / "crew_history.db"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS runs (
@@ -49,6 +53,7 @@ CREATE TABLE IF NOT EXISTS subtasks (
     ran_on       TEXT DEFAULT 'local',   -- local | opus (router: where it ran)
     escalated    INTEGER DEFAULT 0,      -- 0/1: re-dispatched local -> Opus
     escalation_reason TEXT DEFAULT '',   -- failed|unverified|error|predict-concurrency
+    coverage_note TEXT DEFAULT '',       -- spec-coverage review result/outcome
     PRIMARY KEY (run_id, idx)
 );
 """
@@ -68,6 +73,7 @@ class CrewDB:
             "ALTER TABLE subtasks ADD COLUMN ran_on TEXT DEFAULT 'local'",
             "ALTER TABLE subtasks ADD COLUMN escalated INTEGER DEFAULT 0",
             "ALTER TABLE subtasks ADD COLUMN escalation_reason TEXT DEFAULT ''",
+            "ALTER TABLE subtasks ADD COLUMN coverage_note TEXT DEFAULT ''",
         ):
             try:
                 self._exec(ddl)
@@ -99,25 +105,25 @@ class CrewDB:
             self._exec(
                 "INSERT OR REPLACE INTO subtasks (run_id, idx, title, status, attempts, "
                 "gate_outcome, weak_flagged, rejected, regression, elapsed, ran_on, "
-                "escalated, escalation_reason) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "escalated, escalation_reason, coverage_note) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (run["id"], s["idx"], s["title"], s["status"], s["attempts"],
                  s["gate_outcome"], int(bool(s["weak_flagged"])),
                  int(bool(s["rejected"])), int(bool(s["regression"])), s["elapsed"],
                  s.get("ran_on", "local"), int(bool(s.get("escalated"))),
-                 s.get("escalation_reason", "")),
+                 s.get("escalation_reason", ""), s.get("coverage_note", "")),
             )
 
     def _honest_counts(self, run_id: str) -> dict:
         """Re-derive passed/failed/unverified from the authoritative per-subtask
         gate_outcome, so even old rows (whose stored n_passed counted manual-review
         as a pass) report honestly. REAL pass = gate_outcome 'passed' only;
-        'manual'/'rejected'/'none' => unverified (never verified)."""
+        'manual'/'rejected'/'none'/'incomplete' => unverified (never verified)."""
         subs = self._query("SELECT status, gate_outcome FROM subtasks WHERE run_id = ?",
                            (run_id,))
         passed = sum(1 for s in subs if s["gate_outcome"] == "passed")
         failed = sum(1 for s in subs if s["status"] in ("failed", "error"))
         unverified = sum(1 for s in subs
-                         if s["gate_outcome"] in ("manual", "rejected", "none")
+                         if s["gate_outcome"] in ("manual", "rejected", "none", "incomplete")
                          and s["status"] not in ("failed", "error"))
         return {"n_passed": passed, "n_failed": failed, "n_unverified": unverified}
 

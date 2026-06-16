@@ -29,8 +29,25 @@
     margin:0 0 12px}
   textarea,input,select{background:var(--panel2);color:var(--ink);border:1px solid var(--line);
     border-radius:8px;padding:9px 11px;font:inherit;width:100%}
-  textarea{min-height:72px;resize:vertical;font-size:14px}
+  textarea{min-height:92px;resize:vertical;font-size:14px;line-height:1.55;
+    scrollbar-width:thin;scrollbar-color:#39455a transparent}
+  textarea::-webkit-scrollbar{width:10px}
+  textarea::-webkit-scrollbar-thumb{background:#313c4d;border-radius:8px;border:3px solid var(--panel2)}
+  textarea::-webkit-scrollbar-track{background:transparent}
   label{font-size:11px;color:var(--ink-dim);display:block;margin-bottom:4px}
+  /* toggle switches (replace plain checkboxes) */
+  .toggle{display:flex;align-items:center;gap:11px;cursor:pointer;margin-top:11px;
+    font-size:12.5px;color:var(--ink-dim);user-select:none}
+  .toggle input{position:absolute;opacity:0;width:0;height:0}
+  .toggle .track{position:relative;width:40px;height:22px;border-radius:12px;background:#2a3340;
+    border:1px solid var(--line);transition:.18s;flex:none}
+  .toggle .track::after{content:"";position:absolute;top:2px;left:2px;width:16px;height:16px;
+    border-radius:50%;background:#8a97a6;transition:.18s}
+  .toggle input:checked + .track{background:linear-gradient(90deg,var(--brand),var(--brand-2));border-color:transparent}
+  .toggle input:checked + .track::after{transform:translateX(18px);background:#0b0e14}
+  .toggle:hover .track{border-color:var(--brand)}
+  .toggle input:disabled + .track{opacity:.4} .toggle input:disabled ~ span{opacity:.5}
+  .toggle.warn input:checked + .track{background:linear-gradient(90deg,#d29922,#e0a92e)}
   .row{display:flex;gap:12px;flex-wrap:wrap}
   .row > div{flex:1;min-width:150px}
   .row.tight > div{flex:0 0 auto}
@@ -42,6 +59,10 @@
   button.danger{border-color:#5a2a2a;color:#ff9d96}
   button:disabled{opacity:.5;cursor:default}
   .hint{font-size:12px;color:var(--ink-faint);margin-top:8px;font-family:var(--mono)}
+  .bar{height:3px;border-radius:3px;margin-top:12px;background:linear-gradient(90deg,transparent,var(--brand),var(--brand-2),transparent);
+    background-size:40% 100%;background-repeat:no-repeat;animation:slide 1.1s linear infinite}
+  @keyframes slide{0%{background-position:-45% 0}100%{background-position:145% 0}}
+  [hidden]{display:none}
   .check{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--ink-dim);margin-top:10px}
   .check input{width:auto}
   /* run view */
@@ -96,6 +117,16 @@
   .tl{margin-top:8px;display:flex;flex-direction:column;gap:3px}
   .tl-step{font-family:var(--mono);font-size:11px;color:var(--ink-dim)}
   .tl-dim{color:var(--ink-faint)}
+  /* sidebar layout: connection panel on the left, content on the right */
+  .layout{max-width:1180px;margin:0 auto;padding:18px;display:flex;gap:18px;align-items:flex-start}
+  .sidebar{flex:0 0 290px;position:sticky;top:18px}
+  .layout > main{flex:1;min-width:0;max-width:none;margin:0;padding:0}
+  .sidebar .row{flex-direction:column;gap:10px}
+  .sidebar .row > div{flex:1 1 auto !important;width:100%;min-width:0 !important}
+  .sidebar .row.tight{flex-direction:row;gap:8px}
+  .sidebar .row.tight > div{flex:1 1 0}
+  .sidebar .row.tight button{width:100%}
+  @media(max-width:860px){ .layout{flex-direction:column} .sidebar{position:static;flex:1 1 auto;width:100%} }
 </style>
 </head>
 <body>
@@ -107,7 +138,36 @@
   </div>
 </header>
 
-<main>
+<div class="layout">
+  <aside class="sidebar">
+  <!-- connection -->
+  <div class="card">
+    <h2>Connection</h2>
+    <div class="row" style="align-items:end">
+      <div style="flex:0 0 210px"><label>Use Claude via</label>
+        <select id="cl-mode" onchange="clModeChange()">
+          <option value="off">Off — local only</option>
+          <option value="code">Claude Code (subscription)</option>
+          <option value="api">API key</option>
+        </select></div>
+      <div style="flex:0 0 160px"><label>Model</label>
+        <select id="cl-model">
+          <option value="claude-opus-4-8">Opus 4.8</option>
+          <option value="sonnet">Sonnet</option>
+          <option value="haiku">Haiku</option>
+        </select></div>
+      <div id="cl-key-wrap" style="flex:1;min-width:200px" hidden><label>Anthropic API key</label>
+        <input id="cl-key" type="password" placeholder="sk-ant-…  (preferred: set CLAUDE_API_KEY env; a saved key goes to config.json in plaintext)" autocomplete="off"></div>
+    </div>
+    <div class="row tight" style="margin-top:13px">
+      <div><button onclick="saveClaude()">Save</button></div>
+      <div><button id="cl-test" onclick="testClaude()">🛰 Test connection</button></div>
+    </div>
+    <div class="hint" id="cl-status"></div>
+  </div>
+  </aside>
+
+  <main>
   <!-- launch -->
   <div class="card">
     <h2>New run</h2>
@@ -121,12 +181,17 @@
     </div>
     <div style="margin-top:10px"><label>Working folder (optional — where files are written; auto-created if blank)</label>
       <input id="cwd" placeholder="/path/to/project  (blank = a fresh ./crew-workspace/ folder)"></div>
-    <label class="check" id="esc-wrap" title="Off = everything runs local. On = concurrency subtasks route to Opus upfront, and any local subtask that fails / can't self-verify escalates to Opus. Uses paid Opus.">
-      <input id="esc" type="checkbox"> Allow Opus escalation (paid) — predict-route concurrency + escalate local failures</label>
+    <label class="toggle" title="Run unattended — file writes and shell commands run WITHOUT pausing for approval. You're trading the approval gate for autonomy.">
+      <input id="auto-approve" type="checkbox"><span class="track"></span>
+      <span>Auto-approve tools — run unattended (no per-step approval)</span></label>
+    <label class="toggle warn" id="esc-wrap" title="Off = everything runs local. On = concurrency subtasks route to Opus upfront, and any local subtask that fails / can't self-verify escalates to Opus. Uses paid Opus.">
+      <input id="esc" type="checkbox"><span class="track"></span>
+      <span>Allow Opus escalation (paid) — predict-route concurrency + escalate local failures</span></label>
     <div class="row tight" style="margin-top:14px">
       <div><button class="primary" id="go" onclick="launch()">Launch ▸</button></div>
       <div><button id="auto" onclick="autopilot()">✨ Autopilot (draft goal)</button></div>
     </div>
+    <div class="bar" id="bar" hidden></div>
     <div class="hint" id="status"></div>
   </div>
 
@@ -138,7 +203,8 @@
     <h2>History</h2>
     <div id="history"><div class="empty">No runs yet.</div></div>
   </div>
-</main>
+  </main>
+</div>
 
 <script>
 const $ = s => document.querySelector(s);
@@ -170,23 +236,79 @@ async function loadConfig(){
   const escBox = $("#esc");
   if(!CFG.claude_available){ escBox.checked=false; escBox.disabled=true;
     $("#esc-wrap").title = "Escalation needs the claude-agent-sdk (not installed). Local-only."; }
+  applyClaudeAvail();
+}
+
+/* When connection mode = "off" (local only), Claude models can't be picked for
+   manager/worker (and escalation is impossible). Reflect that in the pickers
+   immediately on selection, before Save. */
+function applyClaudeAvail(){
+  const off = ($("#cl-mode")?.value || "code") === "off";
+  for(const sel of [$("#mgr"), $("#wkr")]){
+    if(!sel) continue;
+    let switched = false;
+    for(const o of sel.options){
+      if(o.value.startsWith("claude:")){ o.disabled = off; if(off && sel.value === o.value) switched = true; }
+    }
+    if(switched){ const local=[...sel.options].find(o=>!o.disabled && o.value); if(local) sel.value=local.value; }
+  }
+  if($("#cl-model")) $("#cl-model").disabled = off;
+  if(off){ const e=$("#esc"); if(e){ e.checked=false; e.disabled=true; } }
+}
+
+/* ---- Claude / Opus connection ---- */
+let CL = null;
+async function loadClaude(){
+  try{ CL = await getJSON("/api/claude/status"); }catch{ return; }
+  $("#cl-mode").value = CL.mode;
+  $("#cl-model").value = ["claude-opus-4-8","sonnet","haiku"].includes(CL.model) ? CL.model : "claude-opus-4-8";
+  clModeChange(); renderClStatus();
+}
+function clModeChange(){ $("#cl-key-wrap").hidden = $("#cl-mode").value !== "api"; applyClaudeAvail(); }
+function renderClStatus(extra){
+  if(!CL) return;
+  const p = [ CL.available ? "● enabled" : "○ off",
+              `sdk ${CL.sdk_installed?"✓":"✗"}`, `cli ${CL.cli_found?"✓":"✗"}` ];
+  if(CL.mode==="api") p.push(`key ${CL.api_key_set?("set · "+(CL.api_key_source||"")):"missing — set CLAUDE_API_KEY"}`);
+  $("#cl-status").innerHTML = esc(p.join("  ·  ")) + (extra?`  —  ${esc(extra)}`:"");
+}
+async function saveClaude(){
+  const body = { mode:$("#cl-mode").value, model:$("#cl-model").value };
+  const k = $("#cl-key").value.trim(); if(k) body.api_key = k;
+  try{ CL = await post("/api/claude/config", body); renderClStatus("saved ✓"); $("#cl-key").value=""; await loadConfig(); }
+  catch(e){ renderClStatus("save failed: "+e.message); }
+}
+async function testClaude(){
+  const b=$("#cl-test"); b.disabled=true; b.textContent="testing…";
+  renderClStatus("pinging "+$("#cl-model").value+"… (a few seconds)");
+  try{
+    const d = await post("/api/claude/test",{});
+    if(d.ok) renderClStatus(`✓ connected — ${d.model} replied “${(d.reply||"").trim()}” in ${d.elapsed}s`);
+    else renderClStatus(`✗ ${d.error || ("unexpected reply: "+(d.reply||""))}`);
+  }catch(e){ renderClStatus("✗ test failed: "+e.message); }
+  finally{ b.disabled=false; b.textContent="🛰 Test connection"; }
 }
 
 /* ---- autopilot ---- */
 async function autopilot(){
   const idea = $("#goal").value.trim();
   if(!idea){ $("#status").textContent = "Type a rough idea first, then Autopilot will sharpen it."; return; }
-  const b = $("#auto"); b.disabled=true; b.textContent="thinking…";
+  const b = $("#auto"); b.disabled=true; b.textContent="drafting…";
+  $("#bar").hidden=false;
+  $("#status").textContent = "Autopilot is drafting your goal with a local model… (~10–30s)";
   try{
     const d = await post("/api/crew/advise",{idea});
     if(d.goal) $("#goal").value = d.goal;
     if(d.complexity) $("#cx").value = d.complexity;
     if(d.suggested_tasks) $("#n").value = d.suggested_tasks;
-    if(d.recommended){ if(d.recommended.manager) $("#mgr").value = d.recommended.manager;
-      if(d.recommended.worker) $("#wkr").value = d.recommended.worker; }
-    $("#status").textContent = "Autopilot: " + (d.summary || "goal drafted") + ` · ${d.complexity}, ${d.suggested_tasks} task(s)`;
+    // Deliberately do NOT change your model pickers — only *suggest* a combo.
+    // Silently switching you to a paid model (Opus) would be surprising.
+    let sug = "";
+    if(d.recommended && (d.recommended.manager||d.recommended.worker))
+      sug = ` · suggested combo: ${shortSpec(d.recommended.manager)} mgr + ${shortSpec(d.recommended.worker)} wkr (left unchanged — switch manually if you want it)`;
+    $("#status").textContent = "Autopilot ✓ " + (d.summary || "goal drafted") + ` · ${d.complexity}, ${d.suggested_tasks} task(s)` + sug;
   }catch(e){ $("#status").textContent = "Autopilot failed: " + e.message; }
-  finally{ b.disabled=false; b.textContent="✨ Autopilot (draft goal)"; }
+  finally{ b.disabled=false; b.textContent="✨ Autopilot (draft goal)"; $("#bar").hidden=true; }
 }
 
 /* ---- launch ---- */
@@ -196,7 +318,8 @@ async function launch(){
   if(!goal){ $("#status").textContent="Describe a goal first."; return; }
   const body = { goal, manager:$("#mgr").value, worker:$("#wkr").value,
     max_workers:parseInt($("#n").value)||3, cwd:$("#cwd").value.trim()||null,
-    complexity:$("#cx").value, allow_escalation:$("#esc").checked };
+    complexity:$("#cx").value, allow_escalation:$("#esc").checked,
+    auto_approve:$("#auto-approve").checked };
   if(!body.manager||!body.worker){ $("#status").textContent="Pick a manager and worker model."; return; }
   const b=$("#go"); b.disabled=true; b.textContent="…";
   try{ const r = await post("/api/crew/start",body); activeRunId = r.run_id; $("#status").textContent="Launched "+r.run_id; await poll(); }
@@ -282,11 +405,13 @@ function hDetailHtml(id){
   return (d.subtasks||[]).map(s=>{
     const go=s.gate_outcome, cls=go==="passed"?"tag-ok":(go==="failed"||s.status==="error"?"tag-bad":"tag-warn");
     const flags=[s.weak_flagged?"weak":"",s.rejected?"rejected":"",s.regression?"regressed":""].filter(Boolean).join(" ");
+    const cov = s.coverage_note ? `<div class="hm" style="flex-basis:100%;${/REAL BUG/.test(s.coverage_note)?"color:var(--bad)":""}">coverage: ${esc(s.coverage_note)}</div>` : "";
     return `<div class="hsub">
       <span class="t">${esc(s.title)}</span>
       <span class="${cls}">${esc(s.status)} · gate ${esc(go)}</span>
       ${ranChip(s)}
       <span class="hm">${s.attempts}× · ${s.elapsed!=null?s.elapsed+"s":"—"}${flags?` · ${esc(flags)}`:""}</span>
+      ${cov}
     </div>`;
   }).join("") || `<div class="empty">no subtasks recorded</div>`;
 }
@@ -296,6 +421,7 @@ async function toggleH(id){
   loadHistory();
 }
 
+loadClaude();
 loadConfig();
 loadHistory();
 setInterval(poll, 1300);

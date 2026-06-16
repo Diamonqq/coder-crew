@@ -23,9 +23,16 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
-from . import chat, crew
+from . import chat, claude_conf, crew
 
-_WEB = Path(__file__).resolve().parent.parent / "web"
+claude_conf.apply()   # push saved Claude connection settings into the env at startup
+
+# web/ is read-only and bundled INTO the PyInstaller exe (extracted to _MEIPASS);
+# from source it sits next to the package.
+if getattr(sys, "frozen", False):
+    _WEB = Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent)) / "web"
+else:
+    _WEB = Path(__file__).resolve().parent.parent / "web"
 _HOST = os.environ.get("CREW_HOST", "127.0.0.1")
 _PORT = int(os.environ.get("CREW_PORT", "8770"))
 
@@ -43,6 +50,7 @@ class StartRequest(BaseModel):
     cwd: str | None = None
     complexity: str = "medium"          # simple|medium|hard
     allow_escalation: bool = False      # opt-in: escalate to Opus (paid)
+    auto_approve: bool = False          # opt-in: run unattended, no per-tool approval
 
 
 class AdviseRequest(BaseModel):
@@ -52,6 +60,12 @@ class AdviseRequest(BaseModel):
 class ApproveRequest(BaseModel):
     approved: bool
     note: str = ""
+
+
+class ClaudeConfigRequest(BaseModel):
+    mode: str                       # off | code | api
+    model: str = ""
+    api_key: str | None = None
 
 
 # --- model catalog ----------------------------------------------------------
@@ -87,19 +101,23 @@ def crew_config() -> dict:
             ollama_roles.append({"spec": spec, "label": n, "ready": True})
 
     claude_roles = []
-    if crew._claude_available():
-        claude_roles = [
-            {"spec": "claude:claude-opus-4-8", "label": "Claude Opus 4.8"},
-            {"spec": "claude:sonnet", "label": "Claude Sonnet"},
-            {"spec": "claude:haiku", "label": "Claude Haiku"},
-        ]
+    cfg_model = claude_conf.get()["model"]
+    if claude_conf.available():
+        _labels = {"claude-opus-4-8": "Claude Opus 4.8", "sonnet": "Claude Sonnet",
+                   "haiku": "Claude Haiku"}
+        cseen = set()
+        for m in [cfg_model, "claude-opus-4-8", "sonnet", "haiku"]:
+            if m in cseen:
+                continue
+            cseen.add(m)
+            claude_roles.append({"spec": f"claude:{m}", "label": _labels.get(m, "Claude " + m)})
 
     local_default = next((r["spec"] for r in ollama_roles if r["ready"]),
                          f"ollama:{_Q3_STOCK}")
-    mgr_default = "claude:claude-opus-4-8" if claude_roles else local_default
+    mgr_default = f"claude:{cfg_model}" if claude_roles else local_default
     return {
         "ollama_available": chat.available(),
-        "claude_available": crew._claude_available(),
+        "claude_available": claude_conf.available(),
         "ollama_roles": ollama_roles,
         "claude_roles": claude_roles,
         "defaults": {"manager": mgr_default, "worker": local_default},
@@ -123,7 +141,8 @@ def crew_start(req: StartRequest) -> JSONResponse:
     run = crew.MANAGER.start(
         req.goal.strip(), manager_spec=req.manager, worker_spec=req.worker,
         max_workers=req.max_workers, cwd=req.cwd or None,
-        complexity=req.complexity, allow_escalation=req.allow_escalation)
+        complexity=req.complexity, allow_escalation=req.allow_escalation,
+        auto_approve=req.auto_approve)
     return JSONResponse({"run_id": run.id})
 
 
@@ -169,6 +188,37 @@ def crew_history_detail(run_id: str) -> JSONResponse:
 
 
 # --- status -----------------------------------------------------------------
+@app.get("/api/claude/status")
+def claude_status() -> dict:
+    return claude_conf.status()
+
+
+@app.post("/api/claude/config")
+def claude_set(req: ClaudeConfigRequest) -> dict:
+    return claude_conf.save(req.mode, req.model, req.api_key)
+
+
+@app.post("/api/claude/test")
+def claude_test() -> dict:
+    """Real one-shot PONG round-trip to prove the configured Claude path works."""
+    import time as _t
+    from . import agents
+    if not claude_conf.available():
+        return {"ok": False, "error": "Claude is set to OFF or the claude-agent-sdk "
+                "isn't installed — nothing to test."}
+    model = claude_conf.get()["model"] or "claude-opus-4-8"
+    t0 = _t.time()
+    try:
+        out = agents.make_agent(f"claude:{model}", cwd=None).run_task(
+            "Reply with exactly one word: PONG")
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "model": model, "elapsed": round(_t.time() - t0, 1),
+                "error": f"{type(exc).__name__}: {exc}"}
+    ok = ("PONG" in (out or "").upper()) and not (out or "").startswith("(claude error")
+    return {"ok": ok, "model": model, "elapsed": round(_t.time() - t0, 1),
+            "reply": (out or "").strip()[:200]}
+
+
 @app.get("/api/ollama")
 def ollama_status() -> dict:
     return chat.ollama_status()
@@ -192,12 +242,20 @@ def index() -> FileResponse:
 def main() -> None:
     import uvicorn
     print(f"coder-crew on http://{_HOST}:{_PORT}")
+    cs = claude_conf.status()
     print(f"  Ollama: {'up' if chat.available() else 'NOT reachable — start `ollama serve`'}"
-          f"   ·   Claude/Opus escalation: "
-          f"{'available' if crew._claude_available() else 'not installed (optional)'}")
+          f"   ·   Claude: mode={cs['mode']}, "
+          f"{'available' if cs['available'] else 'off/SDK-missing'} "
+          f"(sdk={'y' if cs['sdk_installed'] else 'n'}, cli={'y' if cs['cli_found'] else 'n'})")
     if _HOST not in ("127.0.0.1", "localhost", "::1"):
         print("  WARNING: bound to a non-loopback host — the crew can run shell "
               "commands. Only do this behind a tunnel + auth.")
+    # Packaged exe (or CREW_OPEN_BROWSER=1): pop the UI open once the server is up.
+    if ((getattr(sys, "frozen", False) or os.environ.get("CREW_OPEN_BROWSER"))
+            and not os.environ.get("CREW_NO_BROWSER")):
+        import threading
+        import webbrowser
+        threading.Timer(1.5, lambda: webbrowser.open(f"http://{_HOST}:{_PORT}")).start()
     uvicorn.run(app, host=_HOST, port=_PORT, log_level="warning")
 
 

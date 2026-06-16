@@ -48,8 +48,12 @@ MAX_REPAIR = 3
 # scaled — the repair loop's quality is kept; only the within-attempt budget moves.)
 _STEP_BUDGET = {"simple": 6, "medium": 10, "hard": 14}
 
-# Where auto-created run folders live (when the user doesn't specify one).
-_WORKSPACE = Path(__file__).resolve().parent.parent / "crew-workspace"
+# Where auto-created run folders live (when the user doesn't specify one). Must be
+# a real, persistent dir — beside the exe when frozen (NOT the temp _MEIPASS, which
+# is deleted on exit and would take the user's generated code with it).
+import sys as _sys
+_WORKSPACE = ((Path(_sys.executable).parent if getattr(_sys, "frozen", False)
+              else Path(__file__).resolve().parent.parent) / "crew-workspace")
 
 
 def _auto_workspace(goal: str) -> str:
@@ -82,6 +86,11 @@ class Worker:
     ran_on: str = "local"              # local | opus — where the (final) attempt ran
     escalated: bool = False            # True if re-dispatched to Opus after local
     escalation_reason: str = ""        # failed | unverified | error | predict-concurrency
+    incomplete_reason: str = ""        # set by the completeness pass: a required
+    #                                    deliverable (e.g. a test) is missing/never-ran.
+    #                                    Forces gate_outcome off "passed" => unverified.
+    coverage_missing: list = field(default_factory=list)  # spec cases the tests omitted
+    coverage_note: str = ""            # human summary of the coverage critique + outcome
 
 
 @dataclass
@@ -104,6 +113,15 @@ class CrewRun:
     # default (no surprise Opus spend); opt-in per run / via the UI.
     allow_escalation: bool = False
     escalation_spec: str = "claude:claude-opus-4-8"
+    # Auto-approve mode: when True, danger tools (file writes / shell) run WITHOUT
+    # pausing for approval — the run goes fully unattended. OFF by default; opt-in
+    # per run / via the UI. You're trading the approval gate for autonomy.
+    auto_approve: bool = False
+    # Spec-coverage review: after a subtask's gate is green, the manager critiques
+    # whether the tests cover the spec's named cases; missing cases trigger a local
+    # retry. Best-effort — only as good as the manager. Defaulted ON only when the
+    # manager is a Claude spec (a local manager's critique is too weak to be worth it).
+    coverage_review: bool = False
     plan: list = field(default_factory=list)
     contract: object = None     # shared interface contract from the plan (or None)
     workers: list = field(default_factory=list)
@@ -213,6 +231,17 @@ _REVIEW_SYS = (
     "failed subtasks, and crashed/errored subtasks — even if a worker claimed "
     "success. Never smooth over or omit a failure. If everything passed, say so "
     "plainly."
+)
+_COVERAGE_SYS = (
+    "You are a strict TEST-COVERAGE reviewer. You are given a goal, a subtask, a "
+    "module's source, and its test file. Your ONLY job: list spec-required behaviors "
+    "/ edge cases that the goal or subtask EXPLICITLY named or CLEARLY implied, and "
+    "that the test file does NOT actually assert. This is about COVERAGE (did the "
+    "tests check everything the spec asked for) — NOT about whether the code is "
+    "correct. Be CONSERVATIVE: only list a case if the spec clearly requires it; if "
+    "you're unsure, leave it out (a false 'missing' triggers needless work). Reply "
+    'with ONLY a JSON object: {"missing": ["<short specific case>", ...], "covered": '
+    '["..."]}. An empty "missing" list means coverage looks complete.'
 )
 
 
@@ -473,6 +502,9 @@ def _estimate(mgr: str, wkr: str, complexity: str, tasks: int) -> dict:
 
 
 def _claude_available() -> bool:
+    import os
+    if os.environ.get("CREW_CLAUDE_OFF"):   # connection set to "off" (see claude_conf)
+        return False
     try:
         import claude_agent_sdk  # noqa: F401
         return True
@@ -594,9 +626,48 @@ def _is_concurrency(text: str) -> bool:
     return bool(re.search(r"\bblocking\b", t, re.I) and re.search(r"\b(queue|put|get)\b", t, re.I))
 
 
+def _is_test_name(name: str) -> bool:
+    return name.startswith("test_") or name.endswith("_test.py")
+
+
+def _all_rel_files(cwd: str) -> list:
+    """Relative paths of every file under cwd, skipping caches."""
+    root = Path(cwd)
+    out = []
+    for p in root.rglob("*"):
+        if p.is_file() and not any(part in ("__pycache__", ".pytest_cache", ".git")
+                                   for part in p.parts):
+            out.append(p.relative_to(root).as_posix())
+    return out
+
+
+def _tests_that_ran(run: "CrewRun") -> "tuple[set, bool]":
+    """Which test files were actually executed by a PASSING gate. Returns
+    (set of test-file basenames named in passing gate commands, whole_suite_ran).
+    A bare `pytest`/`python -m pytest [dir]` that passed ran the WHOLE suite."""
+    ran: set = set()
+    whole = False
+    for w in run.workers:
+        if not (w.gate_passed is True or w.review_gate_passed is True):
+            continue
+        acc = w.acceptance
+        if isinstance(acc, str):
+            pyfiles = re.findall(r"[\w./\\-]+\.py", acc)
+            tests = {Path(f).name for f in pyfiles if _is_test_name(Path(f).name)}
+            if tests:
+                ran |= tests
+            elif not pyfiles and re.match(r"\s*(\"?[^\"\s]*python|pytest)", acc, re.I):
+                whole = True   # ran pytest over a dir / cwd — every test file ran
+    return ran, whole
+
+
 def _subtask_gate_outcome(w: "Worker", rejected: bool) -> str:
     if rejected:
         return "rejected"
+    # A required deliverable (e.g. a module's test) is missing or never ran — the
+    # subtask cannot be "passed" however green its own gate was. Counts as unverified.
+    if getattr(w, "incomplete_reason", ""):
+        return "incomplete"
     if w.acceptance is None:
         return "manual"
     if w.gate_passed is True:
@@ -628,6 +699,7 @@ def _log_run(run: CrewRun) -> None:
             "ran_on": w.ran_on,
             "escalated": w.escalated,
             "escalation_reason": w.escalation_reason,
+            "coverage_note": w.coverage_note,
         })
     run_row = {
         "id": run.id, "goal": run.goal, "complexity": run.complexity,
@@ -656,17 +728,23 @@ class _CrewManager:
               complexity: str = "medium", tag: str = "",
               worker_tools=None, manager_tools=None, worker_use_mcp: bool = True,
               allow_escalation: bool = False,
-              escalation_spec: str = "claude:claude-opus-4-8") -> CrewRun:
+              escalation_spec: str = "claude:claude-opus-4-8",
+              auto_approve: bool = False,
+              coverage_review: "bool | None" = None) -> CrewRun:
         # No folder given => make a fresh one so workers always have a home.
         if not cwd:
             cwd = _auto_workspace(goal)
+        # Default coverage review ON only for a capable (Claude) manager.
+        cov = (coverage_review if coverage_review is not None
+               else manager_spec.startswith("claude:"))
         run = CrewRun(id=uuid.uuid4().hex[:12], goal=goal,
                       manager_spec=manager_spec, worker_spec=worker_spec,
                       max_workers=max(1, min(max_workers, 6)), cwd=cwd,
                       complexity=complexity if complexity in _STEP_BUDGET else "medium",
                       tag=tag, worker_tools=worker_tools, manager_tools=manager_tools,
                       worker_use_mcp=worker_use_mcp, allow_escalation=allow_escalation,
-                      escalation_spec=escalation_spec)
+                      escalation_spec=escalation_spec, auto_approve=auto_approve,
+                      coverage_review=cov)
         with self._lock:
             self.runs[run.id] = run
         threading.Thread(target=self._drive, args=(run,), daemon=True).start()
@@ -704,6 +782,12 @@ class _CrewManager:
             self._work(run)
             if run._cancel:
                 return self._finish(run, "cancelled")
+            self._verify_completeness(run)
+            if run._cancel:
+                return self._finish(run, "cancelled")
+            self._coverage_review(run)
+            if run._cancel:
+                return self._finish(run, "cancelled")
             self._review(run)
             self._finish(run, "done")
         except Exception as exc:  # noqa: BLE001
@@ -713,6 +797,12 @@ class _CrewManager:
 
     def _approver(self, run: CrewRun, worker_id: int):
         def approve(name: str, args: dict):
+            # Auto-approve mode: run unattended — grant without pausing. (The
+            # tool_call is still emitted by the agent loop, so it stays visible.)
+            if run.auto_approve:
+                run.emit({"type": "auto_approved", "tool": name,
+                          "worker_id": worker_id})
+                return True, "auto-approved"
             run.pending = {"tool": name, "args": args, "worker_id": worker_id}
             run.status = "blocked"
             run._gate.clear()
@@ -982,6 +1072,285 @@ class _CrewManager:
             run.emit({"type": "escalation", "worker_id": w.id, "reason": reason,
                       "status": "opus_unavailable"})   # keep local terminal state
 
+    def _verify_completeness(self, run: CrewRun) -> None:
+        """COMPLETENESS PASS (local, honest): a subtask cannot be 'passed' if a
+        deliverable it DECLARED (via `owns`) is missing, or an owned/expected test
+        was never RUN by a gate. Such a subtask is flagged UNVERIFIED (not passed)
+        with a clear reason. Conservative — it only checks what subtasks declared
+        they'd produce; it never invents requirements."""
+        run.emit({"type": "phase", "text": "completeness check"})
+        if not run.cwd:
+            return
+        for w in run.workers:
+            if run._cancel:
+                return
+            if w.status in ("failed", "error"):
+                continue   # already worse than unverified — leave it
+            issues = self._check_one(run, w)
+            if issues and not run._cancel:
+                # STEP 2: try to fix it LOCALLY (write the missing test) before flagging.
+                self._retry_for_completeness(run, w, issues)
+                issues = self._check_one(run, w)   # re-check against the new files
+            if issues:
+                w.incomplete_reason = "; ".join(issues)
+                if w.status == "done":
+                    w.status = "unverified"
+                log.warning("completeness: subtask %d '%s' UNVERIFIED — %s",
+                            w.id, w.title, w.incomplete_reason)
+                run.emit({"type": "completeness", "worker_id": w.id,
+                          "status": "unverified", "reason": w.incomplete_reason})
+            elif w.incomplete_reason:
+                w.incomplete_reason = ""   # a retry resolved it
+                run.emit({"type": "completeness", "worker_id": w.id, "status": "resolved"})
+
+    def _check_one(self, run: CrewRun, w: "Worker") -> list:
+        """Fresh completeness check for one subtask (re-reads disk + gate state, so
+        it reflects any test a retry just wrote)."""
+        try:
+            all_files = _all_rel_files(run.cwd)
+        except OSError:
+            return []
+        ran_tests, whole_suite = _tests_that_ran(run)
+
+        def ran(basenames) -> bool:
+            return whole_suite or any(b in ran_tests for b in basenames)
+
+        return self._completeness_issues(run, w, all_files, ran)
+
+    def _retry_for_completeness(self, run: CrewRun, w: "Worker", issues: list) -> None:
+        """LOCAL retry (qwen fixes qwen — never Opus): re-dispatch the worker with
+        an augmented task to WRITE the missing test, then gate it. Bounded by
+        MAX_REPAIR; on give-up the caller leaves the subtask UNVERIFIED. Uses the
+        same agent/approver/gate/allowlist machinery as the work loop."""
+        steps = _STEP_BUDGET.get(run.complexity, 10)
+        # Let the worker write the test files for its own modules even if it only
+        # formally owned the module (still scoped to THIS subtask's test paths).
+        owns = list(w.owns or [])
+        extra = []
+        for rel in list(owns):
+            base = Path(rel).name
+            if base.endswith(".py") and not _is_test_name(base) and base != "__init__.py":
+                mod, d = base[:-3], Path(rel).parent.as_posix()
+                for cand in ({f"test_{mod}.py", f"tests/test_{mod}.py"}
+                             | ({f"{d}/test_{mod}.py"} if d not in ("", ".") else set())):
+                    if cand not in owns and cand not in extra:
+                        extra.append(cand)
+        retry_owns = owns + extra
+        base_tools = (run.worker_tools if run.worker_tools is not None
+                      else [n for n in toolmod.tool_names() if n != "launch_crew"])
+        for attempt in range(1, MAX_REPAIR + 1):
+            if run._cancel:
+                return
+            run.emit({"type": "phase", "worker_id": w.id,
+                      "text": f"worker {w.id} · {w.title} · completeness retry "
+                              f"{attempt}/{MAX_REPAIR} (write the missing test)"})
+            agent = agents.make_agent(run.worker_spec, max_steps=steps, cwd=run.cwd,
+                                      use_mcp=run.worker_use_mcp, tool_names=base_tools,
+                                      owns=retry_owns)
+            task = (f"Subtask: {w.title}\n\n{w.detail}\n\n"
+                    f"COMPLETENESS PROBLEM: {'; '.join(issues)}.\n"
+                    f"The module(s) you delivered have NO real test that verifies them. "
+                    f"Write a pytest test FILE (named test_<module>.py) with concrete "
+                    f"`assert` statements exercising the behavior — INCLUDING the edge / "
+                    f"invalid cases the goal requires — and make sure it passes. You may "
+                    f"create these files: {', '.join(retry_owns)}.\n"
+                    f"Make the LAST line of your reply EXACTLY:\n"
+                    f"ACCEPTANCE_CMD: pytest <your_test_file> -q\n"
+                    f"It must be a single pytest/unittest command — no shell chaining, "
+                    f"redirects, or `python -c` smoke tests.")
+            try:
+                out = agent.run_task(
+                    task, system=_WORKER_SYS, context=f"Overall goal:\n{run.goal}",
+                    on_event=lambda e, wid=w.id: run.emit({**e, "role": "worker", "worker_id": wid}),
+                    approver=self._approver(run, w.id))
+            except Exception as exc:  # noqa: BLE001
+                run.emit({"type": "error", "worker_id": w.id, "text": f"(retry error: {exc})"})
+                continue
+            w.output = out
+            # Prefer the worker's stated gate (allowlist-validated — a smoke test is
+            # rejected, exactly like anywhere else); else re-run the existing command
+            # (covers the whole-suite case now that the new test exists).
+            derived = _extract_acceptance_cmd(out)
+            if derived and _is_allowed_acceptance_cmd(derived):
+                gate_cmd = derived
+            elif isinstance(w.acceptance, str):
+                gate_cmd = w.acceptance
+            else:
+                continue   # no runnable, allowlisted gate to verify with — try again
+            passed, gout = gate.run_gate(gate_cmd, run.cwd)
+            run.emit({"type": "gate", "worker_id": w.id, "phase": "completeness",
+                      "passed": passed, "output": gout[:600]})
+            if passed:
+                w.acceptance = gate_cmd
+                w.gate_passed = True
+                w.gate_output = gout
+                w.attempts += 1
+                return   # caller re-checks; if the test now ran, it's resolved
+
+    def _completeness_issues(self, run: CrewRun, w: "Worker", all_files, ran) -> list:
+        """The deliverable gaps for one subtask (empty list => complete)."""
+        issues, owns = [], (w.owns or [])
+        # (A) every DECLARED deliverable must exist; declared TESTS must also have run.
+        for rel in owns:
+            base = Path(rel).name
+            if not (Path(run.cwd) / rel).exists():
+                kind = "test" if _is_test_name(base) else "file"
+                issues.append(f"declared {kind} '{rel}' was never created")
+            elif _is_test_name(base) and not ran({base}):
+                issues.append(f"test '{rel}' exists but no gate ran it")
+        # (B) an owned MODULE with no declared test of its own — and not self-verified
+        #     by an embedded pytest — must have SOME corresponding test that ran.
+        declared_test = any(_is_test_name(Path(r).name) for r in owns)
+        embedded_ok = (isinstance(w.acceptance, dict)
+                       and w.acceptance.get("type") == "pytest"
+                       and (w.gate_passed is True or w.review_gate_passed is True))
+        if not declared_test and not embedded_ok:
+            for rel in owns:
+                base = Path(rel).name
+                if (not base.endswith(".py") or _is_test_name(base)
+                        or base == "__init__.py"):
+                    continue
+                mod = base[:-3]
+                cands = {f"test_{mod}.py", f"{mod}_test.py"}
+                present = [f for f in all_files if Path(f).name in cands]
+                if not present:
+                    issues.append(f"module '{rel}' shipped with NO test")
+                elif not ran({Path(f).name for f in present}):
+                    issues.append(f"module '{rel}' has a test but no gate ran it")
+        return issues
+
+    def _coverage_review(self, run: CrewRun) -> None:
+        """SPEC-COVERAGE REVIEW (best-effort, manager-driven): for each genuinely
+        green subtask, have the manager critique whether the tests cover the spec's
+        named cases. Missing cases are recorded (Step 2 then retries to add them).
+        Degrades to a no-op when the manager can't critique (empty result) — it
+        NEVER fabricates failures and NEVER turns into a fake pass."""
+        if not run.coverage_review or not run.cwd:
+            return
+        run.emit({"type": "phase", "text": "spec-coverage review"})
+        for w in run.workers:
+            if run._cancel:
+                return
+            if w.status != "done":            # only critique REAL green subtasks
+                continue
+            mods = [r for r in (w.owns or [])
+                    if r.endswith(".py") and not _is_test_name(Path(r).name)
+                    and Path(r).name != "__init__.py" and (Path(run.cwd) / r).exists()]
+            tests = [r for r in (w.owns or [])
+                     if _is_test_name(Path(r).name) and (Path(run.cwd) / r).exists()]
+            if not mods or not tests:
+                continue   # nothing to critique (no owned module+test pair on disk)
+            missing = self._critique_coverage(run, w, mods, tests)
+            if missing:
+                w.coverage_missing = missing
+                w.coverage_note = "missing spec cases: " + "; ".join(missing)
+                log.warning("coverage: subtask %d '%s' missing spec cases: %s",
+                            w.id, w.title, missing)
+                run.emit({"type": "coverage", "worker_id": w.id, "status": "missing",
+                          "missing": missing})
+                self._retry_for_coverage(run, w, missing)   # STEP 2: add the cases + re-gate
+            else:
+                w.coverage_note = "coverage looks complete"
+                run.emit({"type": "coverage", "worker_id": w.id, "status": "complete",
+                          "missing": []})
+
+    def _retry_for_coverage(self, run: CrewRun, w: "Worker", missing: list) -> None:
+        """LOCAL retry: add the missing spec cases to the TEST file(s) only — the
+        worker may NOT edit the module, so a genuine bug surfaces as a gate FAILURE
+        (the subtask becomes `failed` and names the real bug) instead of being
+        silently patched. If the added assertions pass, coverage improved, stays done."""
+        test_owns = [r for r in (w.owns or []) if _is_test_name(Path(r).name)
+                     and (Path(run.cwd) / r).exists()]
+        if not test_owns:
+            return   # no test file we can extend
+        steps = _STEP_BUDGET.get(run.complexity, 10)
+        cases = "; ".join(missing)
+        for attempt in range(1, MAX_REPAIR + 1):
+            if run._cancel:
+                return
+            run.emit({"type": "phase", "worker_id": w.id,
+                      "text": f"worker {w.id} · {w.title} · coverage retry "
+                              f"{attempt}/{MAX_REPAIR} (add missing spec cases)"})
+            agent = agents.make_agent(run.worker_spec, max_steps=steps, cwd=run.cwd,
+                                      use_mcp=run.worker_use_mcp,
+                                      tool_names=[n for n in toolmod.tool_names() if n != "launch_crew"],
+                                      owns=test_owns)   # TEST files only — module is off-limits
+            task = (f"Subtask: {w.title}\n\n{w.detail}\n\n"
+                    f"Your tests PASS but do NOT cover these spec-required cases: {cases}.\n"
+                    f"Add a pytest assertion for EACH missing case to the test file(s): "
+                    f"{', '.join(test_owns)}. Do NOT modify the module under test — only the "
+                    f"test file(s) (writes elsewhere are refused). Then make the LAST line of "
+                    f"your reply EXACTLY:\nACCEPTANCE_CMD: pytest <your_test_file> -q\n"
+                    f"a single pytest/unittest command — no shell chaining or `python -c` smoke tests.")
+            try:
+                out = agent.run_task(
+                    task, system=_WORKER_SYS, context=f"Overall goal:\n{run.goal}",
+                    on_event=lambda e, wid=w.id: run.emit({**e, "role": "worker", "worker_id": wid}),
+                    approver=self._approver(run, w.id))
+            except Exception as exc:  # noqa: BLE001
+                run.emit({"type": "error", "worker_id": w.id, "text": f"(coverage retry error: {exc})"})
+                continue
+            w.output = out
+            derived = _extract_acceptance_cmd(out)
+            if derived and _is_allowed_acceptance_cmd(derived):
+                gate_cmd = derived
+            elif isinstance(w.acceptance, str):
+                gate_cmd = w.acceptance
+            else:
+                continue   # worker gave no runnable gate yet — try again
+            passed, gout = gate.run_gate(gate_cmd, run.cwd)
+            run.emit({"type": "gate", "worker_id": w.id, "phase": "coverage",
+                      "passed": passed, "output": gout[:600]})
+            w.acceptance = gate_cmd
+            w.gate_output = gout
+            if passed:
+                w.gate_passed = True
+                w.coverage_note = "coverage gap fixed (added + passing): " + cases
+                run.emit({"type": "coverage", "worker_id": w.id, "status": "fixed",
+                          "missing": missing})
+            else:
+                # added assertion FAILED => a real bug on a spec-required case. Honest: fail.
+                w.gate_passed = False
+                w.status = "failed"
+                w.coverage_note = "REAL BUG surfaced by added coverage: " + cases
+                log.warning("coverage: subtask %d FAILED — real bug on spec case(s): %s",
+                            w.id, cases)
+                run.emit({"type": "coverage", "worker_id": w.id, "status": "bug-surfaced",
+                          "missing": missing})
+            return   # gate ran => decision made
+
+    def _critique_coverage(self, run: CrewRun, w: "Worker", mods: list, tests: list) -> list:
+        """Ask the manager which spec-required cases the tests omit. Conservative;
+        returns [] on parse failure / weak critique (=> no-op)."""
+        src = ""
+        for f in mods + tests:
+            try:
+                src += f"\n----- {f} -----\n{(Path(run.cwd) / f).read_text(encoding='utf-8', errors='replace')[:4000]}\n"
+            except OSError:
+                continue
+        mgr = agents.make_agent(run.manager_spec,
+                                tool_names=run.manager_tools or _READONLY,
+                                max_steps=4, cwd=run.cwd)
+        prompt = (f"GOAL:\n{run.goal}\n\nSUBTASK: {w.title}\n{w.detail}\n\n"
+                  f"FILES (module source + its tests):\n{src}\n\n"
+                  f"List spec-required cases the tests do NOT assert (conservative).")
+        try:
+            reply = mgr.run_task(prompt, system=_COVERAGE_SYS,
+                                 on_event=lambda e: run.emit({**e, "role": "manager"}))
+        except Exception as exc:  # noqa: BLE001 — critique failure must not break the run
+            log.warning("coverage critique for subtask %d errored: %s", w.id, exc)
+            return []
+        m = re.search(r"\{.*\}", reply or "", re.S)
+        if not m:
+            return []
+        data = _loads_lenient(m.group(0))
+        if not isinstance(data, dict):
+            return []
+        missing = data.get("missing") or []
+        if not isinstance(missing, list):
+            return []
+        return [str(x).strip() for x in missing if str(x).strip()][:8]
+
     def _review(self, run: CrewRun) -> None:
         run.status = "reviewing"
         run.emit({"type": "phase", "text": "manager reviewing"})
@@ -1021,6 +1390,16 @@ class _CrewManager:
             elif w.status == "error":
                 problems.append(f"Subtask {w.id} '{w.title}' ERRORED (worker crashed): "
                                 f"{(w.output or '')[:200]}")
+            if w.incomplete_reason:   # completeness pass: a required deliverable is missing
+                problems.append(f"Subtask {w.id} '{w.title}' UNVERIFIED — not everything it "
+                                f"was responsible for is verified: {w.incomplete_reason}.")
+                line += f"\ncompleteness: UNVERIFIED — {w.incomplete_reason}"
+            if w.coverage_note:       # spec-coverage review outcome
+                line += f"\ncoverage review: {w.coverage_note}"
+                if "REAL BUG" in w.coverage_note:
+                    problems.append(f"Subtask {w.id} '{w.title}' — spec-coverage review caught a "
+                                    f"REAL BUG: {w.coverage_note.split(': ',1)[-1]} "
+                                    f"(a spec case the original tests omitted).")
             line += f"\nworker report:\n{(w.output or '')[:1200]}"
             sections.append(line)
 
