@@ -1,0 +1,10 @@
+{
+  "_comment": "Optional. Copy to config.json to register MCP tool servers the crew can call. The built-in fetch/git/time servers load automatically if their pip packages are installed; this is only for adding your own.",
+  "mcp_servers": {
+    "example-fs": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "."],
+      "disabled": true
+    }
+  }
+}

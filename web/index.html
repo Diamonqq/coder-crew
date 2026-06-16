@@ -1,0 +1,305 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>coder-crew</title>
+<style>
+  :root{
+    --bg:#0e1117; --panel:#161b22; --panel2:#1c232d; --line:#2a3340;
+    --ink:#e6edf3; --ink-dim:#9aa7b4; --ink-faint:#6b7785;
+    --brand:#7c9cff; --brand-2:#a78bfa; --ok:#3fb950; --bad:#f85149;
+    --warn:#d29922; --opus:#7fb6ff; --mono:ui-monospace,"Cascadia Code",Consolas,monospace;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+    font-family:system-ui,-apple-system,"Segoe UI",sans-serif;font-size:14px;line-height:1.5}
+  a{color:var(--brand)}
+  header{display:flex;align-items:center;gap:14px;padding:14px 22px;
+    border-bottom:1px solid var(--line);background:linear-gradient(180deg,#11161e,#0e1117)}
+  header h1{font-size:17px;margin:0;letter-spacing:.5px;font-weight:650}
+  header h1 .g{background:linear-gradient(90deg,var(--brand),var(--brand-2));
+    -webkit-background-clip:text;background-clip:text;color:transparent}
+  .dot{width:8px;height:8px;border-radius:50%;display:inline-block;background:var(--ink-faint)}
+  .dot.on{background:var(--ok);box-shadow:0 0 6px var(--ok)} .dot.off{background:var(--bad)}
+  .status-chips{margin-left:auto;display:flex;gap:16px;font-size:12px;color:var(--ink-dim)}
+  main{max-width:1080px;margin:0 auto;padding:22px;display:flex;flex-direction:column;gap:18px}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:18px}
+  .card h2{font-size:12px;text-transform:uppercase;letter-spacing:.13em;color:var(--ink-faint);
+    margin:0 0 12px}
+  textarea,input,select{background:var(--panel2);color:var(--ink);border:1px solid var(--line);
+    border-radius:8px;padding:9px 11px;font:inherit;width:100%}
+  textarea{min-height:72px;resize:vertical;font-size:14px}
+  label{font-size:11px;color:var(--ink-dim);display:block;margin-bottom:4px}
+  .row{display:flex;gap:12px;flex-wrap:wrap}
+  .row > div{flex:1;min-width:150px}
+  .row.tight > div{flex:0 0 auto}
+  button{background:var(--panel2);color:var(--ink);border:1px solid var(--line);border-radius:8px;
+    padding:9px 16px;font:inherit;cursor:pointer;transition:.12s}
+  button:hover{border-color:var(--brand)}
+  button.primary{background:linear-gradient(90deg,var(--brand),var(--brand-2));border:none;
+    color:#0b0e14;font-weight:650}
+  button.danger{border-color:#5a2a2a;color:#ff9d96}
+  button:disabled{opacity:.5;cursor:default}
+  .hint{font-size:12px;color:var(--ink-faint);margin-top:8px;font-family:var(--mono)}
+  .check{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--ink-dim);margin-top:10px}
+  .check input{width:auto}
+  /* run view */
+  .run{border:1px solid var(--line);border-radius:12px;background:var(--panel);overflow:hidden}
+  .run-head{display:flex;align-items:center;gap:12px;padding:13px 16px;border-bottom:1px solid var(--line);
+    flex-wrap:wrap;background:var(--panel2)}
+  .phase{display:flex;align-items:center;gap:7px;font-weight:600;font-size:13px}
+  .led{width:9px;height:9px;border-radius:50%;background:var(--ink-faint)}
+  .run[data-status="working"] .led,.run[data-status="planning"] .led,.run[data-status="reviewing"] .led{
+    background:var(--brand);box-shadow:0 0 7px var(--brand);animation:pulse 1.3s infinite}
+  .run[data-status="done"] .led{background:var(--ok);box-shadow:0 0 6px var(--ok)}
+  .run[data-status="blocked"] .led{background:var(--warn);box-shadow:0 0 6px var(--warn)}
+  .run[data-status="error"] .led,.run[data-status="cancelled"] .led{background:var(--bad)}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
+  .goal-txt{color:var(--ink-dim);font-size:13px;flex:1;min-width:200px}
+  .chip{font-family:var(--mono);font-size:11px;color:var(--ink-faint)}
+  .wkrs{padding:12px 16px;display:flex;flex-direction:column;gap:10px}
+  .wkr{border:1px solid var(--line);border-radius:9px;padding:11px 13px;background:var(--panel2)}
+  .wkr[data-status="done"]{border-color:#26402a}.wkr[data-status="failed"],.wkr[data-status="error"]{border-color:#4a2424}
+  .wkr[data-status="unverified"]{border-color:#4a3a16}
+  .wkr-top{display:flex;align-items:center;gap:9px;flex-wrap:wrap}
+  .wkr-title{font-weight:600;font-size:13px}.wkr-id{color:var(--ink-faint);font-family:var(--mono);font-size:11px}
+  .badge{font-family:var(--mono);font-size:10px;padding:2px 8px;border-radius:9px;background:#22303f;color:var(--ink-dim)}
+  .wkr[data-status="done"] .badge{background:#173a1c;color:var(--ok)}
+  .wkr[data-status="failed"] .badge,.wkr[data-status="error"] .badge{background:#3a1717;color:var(--bad)}
+  .wkr[data-status="unverified"] .badge{background:#3a2e16;color:var(--warn)}
+  .ran-opus{font-family:var(--mono);font-size:10px;padding:1px 7px;border-radius:9px;
+    background:#16263a;color:var(--opus);border:1px solid #27456a}
+  .wkr-check{font-family:var(--mono);font-size:11px;color:var(--ink-faint);margin-top:6px;word-break:break-all}
+  .wkr-out{margin-top:8px;font-family:var(--mono);font-size:11px;color:var(--ink-dim);
+    white-space:pre-wrap;max-height:140px;overflow:auto;background:#10151c;border-radius:6px;padding:8px}
+  .approve{margin:12px 16px;padding:13px;border:1px solid var(--warn);border-radius:9px;background:#2a2310}
+  .approve h4{margin:0 0 8px;font-size:13px;color:var(--warn)}
+  .approve pre{font-family:var(--mono);font-size:11px;background:#10151c;padding:8px;border-radius:6px;
+    overflow:auto;max-height:160px}
+  .final{margin:0 16px 16px;padding:13px;border:1px solid #26402a;border-radius:9px;background:#10180f;
+    white-space:pre-wrap;font-size:13px}
+  .final h4{margin:0 0 7px;color:var(--ok);font-size:13px}
+  /* history */
+  .hrun{border:1px solid var(--line);border-radius:9px;margin-bottom:8px;background:var(--panel2)}
+  .hhead{display:flex;align-items:center;gap:10px;padding:10px 13px;cursor:pointer;flex-wrap:wrap}
+  .hhead:hover{background:#1f2733}
+  .hg{flex:1;min-width:160px;font-size:13px}
+  .pf{font-family:var(--mono);font-size:11px}.pf .p{color:var(--ok)}.pf .f{color:var(--bad)}.pf .u{color:var(--warn)}
+  .hm{font-family:var(--mono);font-size:11px;color:var(--ink-faint)}
+  .hdetail{padding:4px 13px 12px;border-top:1px solid var(--line)}
+  .hsub{display:flex;gap:10px;align-items:center;padding:5px 0;border-bottom:1px solid #20283200;flex-wrap:wrap}
+  .hsub .t{flex:1;min-width:140px;font-size:12px}
+  .tag-ok{color:var(--ok)}.tag-bad{color:var(--bad)}.tag-warn{color:var(--warn)}
+  .tag-ok,.tag-bad,.tag-warn{font-family:var(--mono);font-size:11px}
+  .empty{color:var(--ink-faint);font-size:13px;padding:6px 0}
+  .tl{margin-top:8px;display:flex;flex-direction:column;gap:3px}
+  .tl-step{font-family:var(--mono);font-size:11px;color:var(--ink-dim)}
+  .tl-dim{color:var(--ink-faint)}
+</style>
+</head>
+<body>
+<header>
+  <h1>⌬ <span class="g">coder-crew</span></h1>
+  <div class="status-chips">
+    <span><span class="dot" id="ollama-dot"></span> Ollama</span>
+    <span><span class="dot" id="claude-dot"></span> Opus escalation</span>
+  </div>
+</header>
+
+<main>
+  <!-- launch -->
+  <div class="card">
+    <h2>New run</h2>
+    <textarea id="goal" placeholder="Describe a coding goal — e.g. 'Write a Python module that parses ISO-8601 durations to seconds, with a pytest covering edge cases.'"></textarea>
+    <div class="row" style="margin-top:10px;align-items:end">
+      <div><label>Manager (plans + reviews)</label><select id="mgr"></select></div>
+      <div><label>Workers (build)</label><select id="wkr"></select></div>
+      <div style="flex:0 0 90px"><label>Subtasks</label><input id="n" type="number" value="3" min="1" max="6"></div>
+      <div style="flex:0 0 130px"><label>Complexity</label>
+        <select id="cx"><option value="simple">simple</option><option value="medium" selected>medium</option><option value="hard">hard</option></select></div>
+    </div>
+    <div style="margin-top:10px"><label>Working folder (optional — where files are written; auto-created if blank)</label>
+      <input id="cwd" placeholder="D:\path\to\project  (blank = a fresh ./crew-workspace/ folder)"></div>
+    <label class="check" id="esc-wrap" title="Off = everything runs local. On = concurrency subtasks route to Opus upfront, and any local subtask that fails / can't self-verify escalates to Opus. Uses paid Opus.">
+      <input id="esc" type="checkbox"> Allow Opus escalation (paid) — predict-route concurrency + escalate local failures</label>
+    <div class="row tight" style="margin-top:14px">
+      <div><button class="primary" id="go" onclick="launch()">Launch ▸</button></div>
+      <div><button id="auto" onclick="autopilot()">✨ Autopilot (draft goal)</button></div>
+    </div>
+    <div class="hint" id="status"></div>
+  </div>
+
+  <!-- active run -->
+  <div id="run-wrap"></div>
+
+  <!-- history -->
+  <div class="card">
+    <h2>History</h2>
+    <div id="history"><div class="empty">No runs yet.</div></div>
+  </div>
+</main>
+
+<script>
+const $ = s => document.querySelector(s);
+const esc = s => String(s??"").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+async function getJSON(u){ const r = await fetch(u); if(!r.ok) throw new Error(r.status); return r.json(); }
+async function post(u,b){ const r = await fetch(u,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(b||{})});
+  if(!r.ok){ let d; try{d=await r.json()}catch{}; throw new Error(d?.detail||r.status); } return r.json(); }
+function shortSpec(s){ if(!s) return "?"; const p=s.split(":"); return p[0]==="claude"?("claude "+p.slice(1).join(":")):(p[p.length-1]||s); }
+
+/* where a subtask ran: local (no chip) / local→Opus (escalated) / Opus (predict-routed) */
+function ranChip(o){
+  if(!o || o.ran_on!=="opus") return "";
+  if(o.escalated) return `<span class="ran-opus" title="escalated after local ${esc(o.escalation_reason||"")}">local→Opus${o.escalation_reason?` · ${esc(o.escalation_reason)}`:""}</span>`;
+  const why = o.escalation_reason==="predict-concurrency" ? "predict: concurrency" : (o.escalation_reason||"opus");
+  return `<span class="ran-opus" title="routed straight to Opus">Opus · ${esc(why)}</span>`;
+}
+
+/* ---- config / model pickers ---- */
+let CFG = null;
+async function loadConfig(){
+  try{ CFG = await getJSON("/api/crew/config"); }catch{ CFG = {ollama_roles:[],claude_roles:[],defaults:{}}; }
+  $("#ollama-dot").className = "dot " + (CFG.ollama_available ? "on":"off");
+  $("#claude-dot").className = "dot " + (CFG.claude_available ? "on":"off");
+  const opts = arr => arr.map(r=>`<option value="${esc(r.spec)}"${r.ready===false?" disabled":""}>${esc(r.label)}</option>`).join("");
+  $("#mgr").innerHTML = opts([...(CFG.claude_roles||[]), ...(CFG.ollama_roles||[])]);
+  $("#wkr").innerHTML = opts([...(CFG.ollama_roles||[]), ...(CFG.claude_roles||[])]);
+  if(CFG.defaults?.manager) $("#mgr").value = CFG.defaults.manager;
+  if(CFG.defaults?.worker) $("#wkr").value = CFG.defaults.worker;
+  const escBox = $("#esc");
+  if(!CFG.claude_available){ escBox.checked=false; escBox.disabled=true;
+    $("#esc-wrap").title = "Escalation needs the claude-agent-sdk (not installed). Local-only."; }
+}
+
+/* ---- autopilot ---- */
+async function autopilot(){
+  const idea = $("#goal").value.trim();
+  if(!idea){ $("#status").textContent = "Type a rough idea first, then Autopilot will sharpen it."; return; }
+  const b = $("#auto"); b.disabled=true; b.textContent="thinking…";
+  try{
+    const d = await post("/api/crew/advise",{idea});
+    if(d.goal) $("#goal").value = d.goal;
+    if(d.complexity) $("#cx").value = d.complexity;
+    if(d.suggested_tasks) $("#n").value = d.suggested_tasks;
+    if(d.recommended){ if(d.recommended.manager) $("#mgr").value = d.recommended.manager;
+      if(d.recommended.worker) $("#wkr").value = d.recommended.worker; }
+    $("#status").textContent = "Autopilot: " + (d.summary || "goal drafted") + ` · ${d.complexity}, ${d.suggested_tasks} task(s)`;
+  }catch(e){ $("#status").textContent = "Autopilot failed: " + e.message; }
+  finally{ b.disabled=false; b.textContent="✨ Autopilot (draft goal)"; }
+}
+
+/* ---- launch ---- */
+let activeRunId = null;
+async function launch(){
+  const goal = $("#goal").value.trim();
+  if(!goal){ $("#status").textContent="Describe a goal first."; return; }
+  const body = { goal, manager:$("#mgr").value, worker:$("#wkr").value,
+    max_workers:parseInt($("#n").value)||3, cwd:$("#cwd").value.trim()||null,
+    complexity:$("#cx").value, allow_escalation:$("#esc").checked };
+  if(!body.manager||!body.worker){ $("#status").textContent="Pick a manager and worker model."; return; }
+  const b=$("#go"); b.disabled=true; b.textContent="…";
+  try{ const r = await post("/api/crew/start",body); activeRunId = r.run_id; $("#status").textContent="Launched "+r.run_id; await poll(); }
+  catch(e){ $("#status").textContent="Launch failed: "+e.message; }
+  finally{ b.disabled=false; b.textContent="Launch ▸"; }
+}
+
+/* ---- render an active run ---- */
+function workerCard(w){
+  const acc = (w.acceptance==null) ? "no automated check (manual review)"
+    : (typeof w.acceptance==="string" ? w.acceptance : "embedded pytest");
+  const regressed = w.gate_passed===true && w.review_gate_passed===false;
+  const tl = (w.attempts>0) ? `<div class="tl"><div class="tl-step">attempts: ${w.attempts}${w.gate_passed===true?" · gate ✓":w.gate_passed===false?" · gate ✗":""}</div></div>` : "";
+  return `<div class="wkr" data-status="${esc(w.status)}">
+    <div class="wkr-top"><span class="led"></span><span class="wkr-title">${esc(w.title)}</span>
+      <span class="wkr-id">#${w.id}</span>
+      <span class="badge">${esc(w.status)}${w.attempts>1?` ·${w.attempts}×`:""}${regressed?" · regressed":""}</span>
+      ${ranChip(w)}</div>
+    <div class="wkr-check">check: ${esc(acc)}</div>
+    ${tl}
+    ${w.output?`<div class="wkr-out">${esc(w.output)}</div>`:""}</div>`;
+}
+function runHtml(r){
+  const phaseTxt = {planning:"planning",working:"building",reviewing:"reviewing",
+    done:"done",blocked:"awaiting approval",error:"error",cancelled:"cancelled"}[r.status]||r.status;
+  const live = !["done","error","cancelled"].includes(r.status);
+  const wk = (r.workers||[]).map(workerCard).join("")
+    || `<div class="tl-step tl-dim">manager is planning subtasks…</div>`;
+  const ap = r.pending ? `<div class="approve">
+      <h4>🔐 Subtask #${r.pending.worker_id} wants to run <code>${esc(r.pending.tool)}</code></h4>
+      <pre>${esc(JSON.stringify(r.pending.args,null,2).slice(0,1200))}</pre>
+      <button class="primary" onclick="approve('${r.id}',true)">Allow</button>
+      <button class="danger" onclick="approve('${r.id}',false)">Deny</button></div>` : "";
+  return `<div class="run" data-status="${esc(r.status)}">
+    <div class="run-head">
+      <span class="phase"><span class="led"></span>${esc(phaseTxt)}</span>
+      <span class="goal-txt">${esc(r.goal)}</span>
+      <span class="chip">mgr ${esc(shortSpec(r.manager))} · wkr ${esc(shortSpec(r.worker_model))} · ${r.elapsed}s${r.cwd?` · 📁 ${esc(String(r.cwd).split(/[\\\/]/).pop())}`:""}</span>
+      ${live?`<button class="danger" onclick="cancelRun('${r.id}')">Stop</button>`:""}
+    </div>
+    ${ap}
+    <div class="wkrs">${wk}</div>
+    ${r.final?`<div class="final"><h4>Final answer</h4>${esc(r.final)}</div>`:""}
+    ${r.error?`<div class="final" style="border-color:#4a2424;background:#180f0f"><h4 style="color:var(--bad)">Error</h4>${esc(r.error)}</div>`:""}
+  </div>`;
+}
+async function approve(id,ok){ try{ await post(`/api/crew/runs/${id}/approve`,{approved:ok}); await poll(); }catch(e){} }
+async function cancelRun(id){ try{ await post(`/api/crew/runs/${id}/cancel`,{}); await poll(); }catch(e){} }
+
+/* ---- polling ---- */
+async function poll(){
+  let data; try{ data = await getJSON("/api/crew/runs"); }catch{ return; }
+  const runs = data.runs||[];
+  const r = activeRunId ? runs.find(x=>x.id===activeRunId) : runs[0];
+  $("#run-wrap").innerHTML = r ? runHtml(r) : "";
+  // refresh history when nothing is live
+  if(!r || ["done","error","cancelled"].includes(r.status)) loadHistory();
+}
+
+/* ---- history ---- */
+let hOpen = new Set(), hDetail = {};
+async function loadHistory(){
+  let data; try{ data = await getJSON("/api/crew/history"); }catch{ return; }
+  const runs = data.runs||[];
+  const el = $("#history");
+  if(!runs.length){ el.innerHTML = `<div class="empty">No runs yet.</div>`; return; }
+  el.innerHTML = runs.map(r=>{
+    const open = hOpen.has(r.id);
+    return `<div class="hrun">
+      <div class="hhead" onclick="toggleH('${r.id}')">
+        <span>${open?"▾":"▸"}</span>
+        <span class="hg">${esc(r.goal)}</span>
+        <span class="pf"><span class="p">${r.n_passed}✓</span>${r.n_failed?` <span class="f">${r.n_failed}✗</span>`:""}${r.n_unverified?` <span class="u">${r.n_unverified}⚠</span>`:""}/${r.n_subtasks}</span>
+        <span class="hm">${esc(shortSpec(r.manager_spec))}→${esc(shortSpec(r.worker_spec))} · ${esc(r.complexity)} · ${r.elapsed}s · ${esc(r.status)}</span>
+      </div>
+      ${open?`<div class="hdetail" id="hd-${r.id}">${hDetailHtml(r.id)}</div>`:""}
+    </div>`;
+  }).join("");
+}
+function hDetailHtml(id){
+  const d = hDetail[id];
+  if(!d) return `<div class="tl-step tl-dim">loading…</div>`;
+  return (d.subtasks||[]).map(s=>{
+    const go=s.gate_outcome, cls=go==="passed"?"tag-ok":(go==="failed"||s.status==="error"?"tag-bad":"tag-warn");
+    const flags=[s.weak_flagged?"weak":"",s.rejected?"rejected":"",s.regression?"regressed":""].filter(Boolean).join(" ");
+    return `<div class="hsub">
+      <span class="t">${esc(s.title)}</span>
+      <span class="${cls}">${esc(s.status)} · gate ${esc(go)}</span>
+      ${ranChip(s)}
+      <span class="hm">${s.attempts}× · ${s.elapsed!=null?s.elapsed+"s":"—"}${flags?` · ${esc(flags)}`:""}</span>
+    </div>`;
+  }).join("") || `<div class="empty">no subtasks recorded</div>`;
+}
+async function toggleH(id){
+  if(hOpen.has(id)) hOpen.delete(id);
+  else{ hOpen.add(id); if(!hDetail[id]){ try{ hDetail[id]=await getJSON(`/api/crew/history/${id}`); }catch{} } }
+  loadHistory();
+}
+
+loadConfig();
+loadHistory();
+setInterval(poll, 1300);
+poll();
+</script>
+</body>
+</html>

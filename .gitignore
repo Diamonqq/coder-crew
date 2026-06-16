@@ -1,0 +1,20 @@
+# python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# runtime data
+crew_history.db
+crew-workspace/
+*.log
+
+# local config (may hold tokens / machine-specific paths / MCP server env)
+config.json
+
+# os / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

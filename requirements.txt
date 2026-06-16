@@ -1,0 +1,11 @@
+# core
+fastapi>=0.110
+uvicorn>=0.29
+
+# --- optional ---
+# Opus escalation (the local-vs-Opus auto-router). Without it, coder-crew runs
+# fully local; allow_escalation just no-ops. Install to enable:
+#   pip install claude-agent-sdk
+#
+# MCP tool servers (fetch / git / time) exposed to the crew. Optional:
+#   pip install mcp mcp-server-fetch mcp-server-git mcp-server-time
