@@ -19,7 +19,7 @@ manager (plan) ──► worker · worker · worker ──► manager (review + 
                       └─ each subtask: implement → run its acceptance gate → repair (≤3) 
 ```
 
-## What it does — and doesn't — guarantee
+## What it does and doesn't guarantee
 
 Honesty about the boundary is the whole point:
 
