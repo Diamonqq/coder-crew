@@ -403,8 +403,11 @@ _READONLY = ["list_dir", "read_file", "web_search", "web_fetch", "get_time"]
 
 
 # --- Autopilot / advisor ----------------------------------------------------
-_Q3 = "huihui_ai/qwen3-coder-abliterated:30b"   # primary: agentic MoE, 3.3B active
-_CODER = "huihui_ai/qwen2.5-coder-abliterate"   # dense fallbacks
+_Q3 = "qwen3-coder:30b"     # primary: stock agentic MoE (~3.3B active), fits 24GB
+_CODER = "qwen2.5-coder"    # stock dense fallbacks (tags :7b / :14b / :32b)
+# (Advanced: abliterated builds like "huihui_ai/qwen3-coder-abliterated:30b" work
+# too if you type the spec yourself, but they remove the model's refusal behavior,
+# so they are NOT a shipped default.)
 # Rough perf/quality facts for an RX 7900 XTX (24GB). tps = generated tok/s.
 _MODEL_INFO = {
     _Q3: {"label": "Qwen3-Coder 30B", "tps": 60, "quality": 5, "vram": 19.0},

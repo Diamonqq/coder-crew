@@ -54,7 +54,9 @@ manager (plan) ──► worker · worker · worker ──► manager (review + 
 ```bash
 git clone https://github.com/Diamonqq/coder-crew
 cd coder-crew
-python -m venv .venv && .venv/Scripts/activate      # (Linux/macOS: source .venv/bin/activate)
+python -m venv .venv
+source .venv/bin/activate        # Linux / macOS
+.venv\Scripts\activate           # Windows
 pip install -r requirements.txt
 
 python run.py            # or: python -m crewkit.server
@@ -93,6 +95,10 @@ without a tunnel + authentication in front of it. Acceptance-check commands are
 restricted to a single test-runner invocation (no shell chaining) by an allowlist —
 that allowlist, not a sandbox, is what keeps a model-authored check from being an
 arbitrary command.
+
+The optional unattended auto-approve mode runs file writes and shell commands
+**without review** — using it trades the approval gate for autonomy, so only point
+it at work (and a folder) you trust.
 
 ## License
 
