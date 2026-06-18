@@ -6,7 +6,7 @@ results into a final answer.
 
   manager (plan) ──► worker · worker · worker ──► manager (review + synthesize)
 
-Roles are pluggable agent specs (see crewkit.agents.make_agent):
+Roles are pluggable agent specs (see agent.agents.make_agent):
   ollama:<model>            e.g. ollama:qwen3-coder:30b
   claude:<model>            e.g. claude:claude-opus-4-8  (real Claude Code session)
 
@@ -48,12 +48,68 @@ MAX_REPAIR = 3
 # scaled — the repair loop's quality is kept; only the within-attempt budget moves.)
 _STEP_BUDGET = {"simple": 6, "medium": 10, "hard": 14}
 
-# Where auto-created run folders live (when the user doesn't specify one). Must be
-# a real, persistent dir — beside the exe when frozen (NOT the temp _MEIPASS, which
-# is deleted on exit and would take the user's generated code with it).
-import sys as _sys
-_WORKSPACE = ((Path(_sys.executable).parent if getattr(_sys, "frozen", False)
-              else Path(__file__).resolve().parent.parent) / "crew-workspace")
+# Where auto-created run folders live (when the user doesn't specify one).
+_WORKSPACE = Path(__file__).resolve().parent.parent / "crew-workspace"
+_REPORTS = Path(__file__).resolve().parent.parent / "data" / "research"
+
+
+def _save_report(run) -> str | None:
+    """Persist a finished research run's synthesis as a markdown file on disk so the
+    user has a real artifact. Best-effort: a write failure must not break the run."""
+    if not (run.final or "").strip():
+        return None
+    try:
+        slug = re.sub(r"[^a-z0-9]+", "-", (run.goal or "report").lower()).strip("-")[:48] or "report"
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        _REPORTS.mkdir(parents=True, exist_ok=True)
+        path = _REPORTS / f"{slug}-{stamp}.md"
+        header = f"# Research: {run.goal}\n\n_Generated {datetime.now():%Y-%m-%d %H:%M} · {run.manager_spec}_\n\n---\n\n"
+        path.write_text(header + run.final, encoding="utf-8")
+        return str(path)
+    except OSError:
+        return None
+
+
+class _Cancelled(Exception):
+    """Raised at a research checkpoint when the user hits Stop (run._cancel)."""
+
+
+def _ledger_totals(run_id: str) -> dict:
+    try:
+        from . import ledger
+        return ledger.run_totals(run_id)
+    except Exception:  # noqa: BLE001
+        return {"total": 0, "by": []}
+
+
+def list_reports() -> list:
+    """Saved research reports on disk, newest first — so reports survive restarts
+    (in-memory runs don't)."""
+    try:
+        files = sorted(_REPORTS.glob("*.md"), key=lambda p: p.stat().st_mtime, reverse=True)
+    except OSError:
+        return []
+    out = []
+    for p in files[:100]:
+        try:
+            st = p.stat()
+        except OSError:
+            continue
+        out.append({"name": p.name, "size": st.st_size, "mtime": st.st_mtime})
+    return out
+
+
+def read_report(name: str) -> str | None:
+    """Read one saved report by bare filename (path-traversal-safe)."""
+    if not name or "/" in name or "\\" in name or ".." in name:
+        return None
+    p = _REPORTS / name
+    if not p.is_file():
+        return None
+    try:
+        return p.read_text(encoding="utf-8")
+    except OSError:
+        return None
 
 
 def _auto_workspace(goal: str) -> str:
@@ -86,11 +142,11 @@ class Worker:
     ran_on: str = "local"              # local | opus — where the (final) attempt ran
     escalated: bool = False            # True if re-dispatched to Opus after local
     escalation_reason: str = ""        # failed | unverified | error | predict-concurrency
-    incomplete_reason: str = ""        # set by the completeness pass: a required
-    #                                    deliverable (e.g. a test) is missing/never-ran.
-    #                                    Forces gate_outcome off "passed" => unverified.
+    incomplete_reason: str = ""        # completeness pass: a required deliverable
+    #                                    (e.g. a module's test) is missing/never-ran
+    #                                    => forces gate_outcome off "passed" (unverified).
     coverage_missing: list = field(default_factory=list)  # spec cases the tests omitted
-    coverage_note: str = ""            # human summary of the coverage critique + outcome
+    coverage_note: str = ""            # spec-coverage review summary + outcome
 
 
 @dataclass
@@ -113,14 +169,17 @@ class CrewRun:
     # default (no surprise Opus spend); opt-in per run / via the UI.
     allow_escalation: bool = False
     escalation_spec: str = "claude:claude-opus-4-8"
-    # Auto-approve mode: when True, danger tools (file writes / shell) run WITHOUT
-    # pausing for approval — the run goes fully unattended. OFF by default; opt-in
-    # per run / via the UI. You're trading the approval gate for autonomy.
+    # Auto-approve mode: danger tools (file writes / shell) run WITHOUT pausing for
+    # approval — fully unattended. OFF by default; opt-in per run / via the UI.
     auto_approve: bool = False
-    # Spec-coverage review: after a subtask's gate is green, the manager critiques
-    # whether the tests cover the spec's named cases; missing cases trigger a local
-    # retry. Best-effort — only as good as the manager. Defaulted ON only when the
-    # manager is a Claude spec (a local manager's critique is too weak to be worth it).
+    # Incognito assistant run — kept out of the runs list and never persisted, so
+    # the conversation leaves no trace.
+    incognito: bool = False
+    # Research-swarm config (None for normal coder runs): see start_research.
+    research_cfg: object = None
+    # Spec-coverage review: after a green subtask, the manager critiques whether the
+    # tests cover the spec's named cases; missing cases trigger a local retry. Best-
+    # effort. Default ON only when the manager is a Claude spec (local critique is weak).
     coverage_review: bool = False
     plan: list = field(default_factory=list)
     contract: object = None     # shared interface contract from the plan (or None)
@@ -130,6 +189,11 @@ class CrewRun:
     error: str = ""
     created: float = field(default_factory=time.time)
     ended: float | None = None
+    report_file: str | None = None     # saved markdown path (research runs)
+    code_rounds: int = 1               # >1 = looped autonomous coder (manager re-plans each round)
+    support_researchers: int = 0       # >0 = research-augmented coder: N researchers/round feed the build
+    support_spec: str = ""             # model the support researchers use
+    research_notes: str = ""           # latest round's gathered research, injected into plan + build
 
     # --- approval / control plumbing (not serialized) ---
     pending: dict | None = None          # {tool, args, worker_id}
@@ -140,6 +204,16 @@ class CrewRun:
     def emit(self, ev: dict) -> None:
         ev["t"] = time.time()
         self.events.append(ev)
+        # Persist token usage to the granular ledger (survives the event cap below).
+        if ev.get("type") == "usage":
+            try:
+                from . import ledger
+                key = ("w" + str(ev["worker_id"])) if ev.get("worker_id") is not None \
+                    else (ev.get("role") or ev.get("agent") or "?")
+                ledger.log(self.id, key, ev.get("role"), ev.get("agent"),
+                           ev.get("tokens"), ev.get("rate"))
+            except Exception:  # noqa: BLE001
+                pass
         if len(self.events) > _MAX_EVENTS:
             del self.events[: len(self.events) - _MAX_EVENTS]
 
@@ -154,13 +228,21 @@ class CrewRun:
             "plan": self.plan,
             "contract": self.contract,
             "workers": [vars(w) for w in self.workers],
-            "events": self.events[-120:],
+            "events": self.events[-250:],
             "final": self.final,
             "error": self.error,
             "pending": self.pending,
             "created": self.created,
             "ended": self.ended,
             "elapsed": round((self.ended or time.time()) - self.created, 1),
+            "report_file": self.report_file,
+            "code_rounds": self.code_rounds,     # >1 = looped autonomous coder
+            "ledger": _ledger_totals(self.id),   # persisted per-role/model token totals
+            "research": ({"n_submanagers": self.research_cfg.get("n_submanagers"),
+                          "n_researchers": self.research_cfg.get("n_researchers"),
+                          "submanager": self.research_cfg.get("submanager_spec"),
+                          "researcher": self.research_cfg.get("researcher_spec")}
+                         if self.research_cfg else None),
         }
 
 
@@ -220,6 +302,15 @@ _WORKER_SYS = (
     "saw the output. ONLY after the work is actually done and verified, reply with "
     "a short plain-text report of what you did and the file paths involved."
 )
+_ASSISTANT_SYS = (
+    "You are coder-crew's built-in coding assistant. You can not only chat — you "
+    "can TAKE ACTIONS via tools: read/write files, run shell commands, list "
+    "directories, search/fetch the web, and launch_crew (spin up an autonomous "
+    "coder crew to build something larger). When the user asks you to DO something, "
+    "actually call the tool — don't just describe it. Anything risky (shell, file "
+    "writes, launching a crew) pauses for the user's approval before it runs, so act "
+    "decisively and let them approve. Be concise."
+)
 _REVIEW_SYS = (
     "You are the MANAGER doing a VERIFYING review. You are given each subtask's "
     "VERIFIED status — its acceptance gate was just RE-RUN against the real files, "
@@ -253,14 +344,31 @@ _REPAIR_DIRECTIVE = (
 )
 
 
+def _distill_gate(out: str) -> str:
+    """Structured error feedback (#3): pull just the lines that matter (errors,
+    assertions, the pytest summary) instead of dumping raw output the model drowns in.
+    Cuts repair attempts because the signal isn't buried in noise."""
+    out = out or ""
+    lines = out.splitlines()
+    pat = re.compile(r"(?i)(error|assert|fail|exception|traceback|^E\s|importerror|"
+                     r"syntaxerror|nameerror|typeerror|attributeerror|\bnot found\b)")
+    key = [ln for ln in lines if pat.search(ln)]
+    picked, seen = [], set()
+    for ln in key[:18] + lines[-6:]:            # key error lines + the summary tail
+        s = ln.strip()
+        if s and s not in seen:
+            seen.add(s)
+            picked.append(ln.rstrip())
+    return ("\n".join(picked)[:1400]) or out[:1200]
+
+
 def _repair_task(w: "Worker", prev_output: str) -> str:
-    """Augmented task for a repair attempt: original detail + what the worker last
-    reported + the failing gate output (the critical signal) + a fix directive."""
+    """Repair-attempt prompt: original spec + the DISTILLED failure (the lines that
+    matter) + a fix directive. Focused signal → far fewer wasted retries."""
     return (
         f"Subtask: {w.title}\n\n{w.detail}\n\n"
-        f"--- YOUR PREVIOUS ATTEMPT REPORTED ---\n{(prev_output or '(nothing)')[:2000]}\n\n"
-        f"--- ACCEPTANCE CHECK FAILED — its output ---\n{(w.gate_output or '')[:2500]}\n\n"
-        f"{_REPAIR_DIRECTIVE}"
+        f"--- THE ACCEPTANCE TEST FAILED. The lines that matter ---\n{_distill_gate(w.gate_output)}\n\n"
+        f"Fix ONLY what these errors point to (don't rewrite passing parts). {_REPAIR_DIRECTIVE}"
     )
 
 
@@ -428,15 +536,19 @@ def _weak_reason(acc) -> str | None:
     return None
 
 
-_READONLY = ["list_dir", "read_file", "web_search", "web_fetch", "get_time"]
+_READONLY = ["list_dir", "read_file", "system_stats", "web_search",
+             "web_fetch", "get_time", "read_notes"]
+
+# Tools a read-only research worker (Claude) must NOT have — keeps an autonomous,
+# auto-approved swarm from writing files or running commands.
+_RESEARCH_BLOCK = ["Bash", "Write", "Edit", "MultiEdit", "NotebookEdit"]
+# Local-model research workers get only these.
+_RESEARCH_TOOLS = ["web_search", "web_fetch", "read_file", "get_time"]
 
 
 # --- Autopilot / advisor ----------------------------------------------------
-_Q3 = "qwen3-coder:30b"     # primary: stock agentic MoE (~3.3B active), fits 24GB
-_CODER = "qwen2.5-coder"    # stock dense fallbacks (tags :7b / :14b / :32b)
-# (Advanced: abliterated builds like "huihui_ai/qwen3-coder-abliterated:30b" work
-# too if you type the spec yourself, but they remove the model's refusal behavior,
-# so they are NOT a shipped default.)
+_Q3 = "huihui_ai/qwen3-coder-abliterated:30b"   # primary: agentic MoE, 3.3B active
+_CODER = "huihui_ai/qwen2.5-coder-abliterate"   # dense fallbacks
 # Rough perf/quality facts for an RX 7900 XTX (24GB). tps = generated tok/s.
 _MODEL_INFO = {
     _Q3: {"label": "Qwen3-Coder 30B", "tps": 60, "quality": 5, "vram": 19.0},
@@ -454,6 +566,39 @@ _ADVISE_SYS = (
     'how to verify>", "complexity": "simple|medium|hard", "suggested_tasks": <1-6>, '
     '"summary": "<one short line>"}'
 )
+
+
+_ENHANCE_SYS = (
+    "You are a prompt engineer for an autonomous build/research agent. Rewrite the "
+    "user's rough idea into ONE clear, specific, self-contained prompt the agent can "
+    "act on directly. PRESERVE their intent and scope — do not invent a different "
+    "project or pad it out. Make it concrete: state exactly what to build or research, "
+    "the key requirements, and how success is verified. If it's a software build, "
+    "require tests and say it must actually run them. Keep it tight — a short paragraph "
+    "or a few bullet lines. Output ONLY the improved prompt: no preamble, no "
+    "explanation, no surrounding quotes or markdown headers."
+)
+
+
+def enhance_prompt(text: str, spec: str) -> str:
+    """Rewrite a rough Create-tab idea into a sharper prompt, using the chosen model.
+    ollama: specs go through the chat endpoint (one fast call); claude: specs use a
+    one-turn tool-less agent. Any failure falls back to the original text unchanged."""
+    text = (text or "").strip()
+    if not text:
+        return ""
+    try:
+        if spec.startswith("claude:"):
+            out = agents.make_agent(spec, max_turns=1).run_task(text, system=_ENHANCE_SYS)
+        else:
+            from . import chat
+            model = spec.split("ollama:")[-1]
+            res = chat.chat(model, [{"role": "system", "content": _ENHANCE_SYS},
+                                    {"role": "user", "content": text}], timeout=120)
+            out = res.get("reply", "")
+        return (out or "").strip() or text
+    except Exception:  # noqa: BLE001 — never fail the box; return what they typed
+        return text
 
 
 def _installed_models() -> set:
@@ -642,9 +787,9 @@ def _all_rel_files(cwd: str) -> list:
 
 
 def _tests_that_ran(run: "CrewRun") -> "tuple[set, bool]":
-    """Which test files were actually executed by a PASSING gate. Returns
-    (set of test-file basenames named in passing gate commands, whole_suite_ran).
-    A bare `pytest`/`python -m pytest [dir]` that passed ran the WHOLE suite."""
+    """Which test files were executed by a PASSING gate. Returns (set of test-file
+    basenames named in passing gate commands, whole_suite_ran). A bare `pytest` /
+    `python -m pytest [dir]` that passed ran the WHOLE suite."""
     ran: set = set()
     whole = False
     for w in run.workers:
@@ -657,15 +802,15 @@ def _tests_that_ran(run: "CrewRun") -> "tuple[set, bool]":
             if tests:
                 ran |= tests
             elif not pyfiles and re.match(r"\s*(\"?[^\"\s]*python|pytest)", acc, re.I):
-                whole = True   # ran pytest over a dir / cwd — every test file ran
+                whole = True
     return ran, whole
 
 
 def _subtask_gate_outcome(w: "Worker", rejected: bool) -> str:
     if rejected:
         return "rejected"
-    # A required deliverable (e.g. a module's test) is missing or never ran — the
-    # subtask cannot be "passed" however green its own gate was. Counts as unverified.
+    # A required deliverable (e.g. a module's test) is missing or never ran — cannot
+    # be "passed" however green its own gate was. Counts as unverified.
     if getattr(w, "incomplete_reason", ""):
         return "incomplete"
     if w.acceptance is None:
@@ -730,13 +875,15 @@ class _CrewManager:
               allow_escalation: bool = False,
               escalation_spec: str = "claude:claude-opus-4-8",
               auto_approve: bool = False,
-              coverage_review: "bool | None" = None) -> CrewRun:
+              coverage_review: "bool | None" = None, rounds: int = 1,
+              support_researchers: int = 0, support_spec: str = "") -> CrewRun:
         # No folder given => make a fresh one so workers always have a home.
         if not cwd:
             cwd = _auto_workspace(goal)
         # Default coverage review ON only for a capable (Claude) manager.
         cov = (coverage_review if coverage_review is not None
                else manager_spec.startswith("claude:"))
+        rounds = max(1, min(int(rounds), 6))
         run = CrewRun(id=uuid.uuid4().hex[:12], goal=goal,
                       manager_spec=manager_spec, worker_spec=worker_spec,
                       max_workers=max(1, min(max_workers, 6)), cwd=cwd,
@@ -744,18 +891,404 @@ class _CrewManager:
                       tag=tag, worker_tools=worker_tools, manager_tools=manager_tools,
                       worker_use_mcp=worker_use_mcp, allow_escalation=allow_escalation,
                       escalation_spec=escalation_spec, auto_approve=auto_approve,
-                      coverage_review=cov)
+                      coverage_review=cov, code_rounds=rounds,
+                      support_researchers=max(0, min(int(support_researchers), 8)),
+                      support_spec=support_spec or worker_spec)
+        # rounds>1 → autonomous looped coder (manager re-plans on results each round).
+        # Force auto_approve so it can run unattended.
+        if rounds > 1:
+            run.auto_approve = True
         with self._lock:
             self.runs[run.id] = run
-        threading.Thread(target=self._drive, args=(run,), daemon=True).start()
+        driver = self._drive_loop if rounds > 1 else self._drive
+        threading.Thread(target=driver, args=(run,), daemon=True).start()
         return run
+
+    def start_assistant(self, text: str, model_spec: str,
+                        history: list | None = None,
+                        incognito: bool = False) -> CrewRun:
+        """Run the chat-bubble assistant as a tool-using agent. It reuses the
+        SAME CrewRun + _approver machinery as workers, so any danger/MCP tool the
+        assistant calls pauses for approval exactly like a worker's would."""
+        run = CrewRun(id=uuid.uuid4().hex[:12], goal=text, manager_spec=model_spec,
+                      worker_spec=model_spec, max_workers=1, cwd=None,
+                      incognito=incognito)
+        with self._lock:
+            self.runs[run.id] = run
+        threading.Thread(target=self._drive_assistant,
+                         args=(run, history or []), daemon=True).start()
+        return run
+
+    def _drive_assistant(self, run: CrewRun, history: list) -> None:
+        run.status = "working"
+        # Full toolset (incl. launch_crew) + MCP. The approver is the IDENTICAL
+        # function workers use — danger/MCP calls block on run.pending until the
+        # user approves via the same /api/crew/runs/{id}/approve endpoint.
+        agent = agents.make_agent(run.manager_spec, max_steps=10, use_mcp=True)
+        ctx = "\n".join(f"{m.get('role')}: {m.get('content','')}"
+                        for m in history[-8:] if m.get("content"))
+        try:
+            run.final = agent.run_task(
+                run.goal, system=_ASSISTANT_SYS, context=ctx,
+                on_event=lambda e: run.emit({**e, "role": "assistant"}),
+                approver=self._approver(run, 0))  # <-- same gating path as workers
+            run.status = "done"
+        except Exception as exc:  # noqa: BLE001
+            run.error = f"{type(exc).__name__}: {exc}"
+            run.status = "error"
+        run.ended = time.time()
+
+    # -- research swarm --------------------------------------------------------
+    def start_research(self, topic: str, *, manager_spec: str,
+                       submanager_spec: str, researcher_spec: str,
+                       n_submanagers: int, n_researchers: int,
+                       rounds: int = 1) -> CrewRun:
+        """Fan a topic out to a swarm of researchers, then synthesize + rank.
+          • flat (n_submanagers=0): manager -> n_researchers -> ranked report
+          • tiered: manager -> n_submanagers -> n_researchers each -> report
+          • LOOPED (rounds>1, flat): the manager runs multiple bounded ROUNDS —
+            after each it reviews the findings and either declares DONE or names the
+            specific remaining GAPS as the next round's angles, then synthesizes all
+            rounds. This is the looped-Opus orchestrator (re-plan on info from leaves).
+        Researchers are read-only; auto-approved. Trades tokens for breadth/depth."""
+        cfg = {"submanager_spec": submanager_spec, "researcher_spec": researcher_spec,
+               "n_submanagers": max(0, min(int(n_submanagers), 8)),
+               "n_researchers": max(1, min(int(n_researchers), 10)),
+               "rounds": max(1, min(int(rounds), 5))}
+        run = CrewRun(id=uuid.uuid4().hex[:12], goal=topic, manager_spec=manager_spec,
+                      worker_spec=researcher_spec, max_workers=cfg["n_researchers"],
+                      cwd=None, auto_approve=True)
+        run.research_cfg = cfg
+        with self._lock:
+            self.runs[run.id] = run
+        driver = self._drive_looped if cfg["rounds"] > 1 else self._drive_research
+        threading.Thread(target=driver, args=(run,), daemon=True).start()
+        return run
+
+    def autopilot(self, idea: str, *, manager_spec: str, researcher_spec: str,
+                  builder_spec: str, build=None) -> CrewRun:
+        """One-prompt orchestrator: a planner model reads the idea, decides the whole
+        pipeline (research vs build, #researchers, rounds, refined goal), then launches
+        it. `build` (the UI toggle) overrides the build decision when not None."""
+        planner = agents.make_agent(manager_spec, tool_names=[], max_steps=2) \
+            if manager_spec.startswith("ollama:") else agents.make_agent(manager_spec, max_turns=2)
+        prompt = (
+            "You are sizing a task for an autonomous agent swarm. The user's idea:\n\n"
+            f"{idea}\n\n"
+            "Reply with ONLY a JSON object, no prose:\n"
+            '{"build": <true if they want software CREATED/built, false if it is a question/'
+            'topic to research>, "n_researchers": <2-8, how many parallel researchers fit the '
+            'breadth>, "rounds": <1-4, how many iterative rounds the depth warrants>, '
+            '"goal": "<one clear sentence restating the goal>"}')
+        cfgj = {}
+        try:
+            reply = planner.run_task(prompt)
+            m = re.search(r"\{.*\}", reply or "", re.S)
+            if m:
+                cfgj = json.loads(m.group(0))
+        except Exception:  # noqa: BLE001
+            cfgj = {}
+        do_build = build if build is not None else bool(cfgj.get("build"))
+        goal = (cfgj.get("goal") or idea).strip()
+        n = max(2, min(int(cfgj.get("n_researchers", 4) or 4), 8))
+        rounds = max(1, min(int(cfgj.get("rounds", 1) or 1), 4))
+        if do_build:
+            return self.start(goal, manager_spec=manager_spec, worker_spec=builder_spec,
+                              max_workers=3, rounds=max(2, rounds),
+                              support_researchers=n, support_spec=researcher_spec)
+        return self.start_research(goal, manager_spec=manager_spec,
+                                   submanager_spec=researcher_spec, researcher_spec=researcher_spec,
+                                   n_submanagers=0, n_researchers=n, rounds=rounds)
+
+    def _research_agent(self, spec: str, *, max_steps: int = 6, role: str = "researcher"):
+        """A read-only agent (web + read tools only) for research. Per-role tuning
+        (Tier-1 #1/#5): researchers get a tiny context + short keep_alive so they
+        can't evict the resident manager, and a tight timeout (the watchdog — a
+        stuck leaf fails fast instead of hanging the swarm). Ignored for Claude."""
+        budgets = {"manager":    {"num_ctx": 16384, "keep_alive": "20m", "timeout": 600.0},
+                   "submanager": {"num_ctx": 8192,  "keep_alive": "5m",  "timeout": 300.0},
+                   "researcher": {"num_ctx": 4096,  "keep_alive": "60s", "timeout": 180.0}}
+        b = budgets.get(role, budgets["researcher"])
+        if spec.startswith("claude:"):
+            return agents.make_agent(spec, max_turns=max_steps,
+                                     disallowed_tools=_RESEARCH_BLOCK)
+        return agents.make_agent(spec, tool_names=_RESEARCH_TOOLS,
+                                 max_steps=max_steps, use_mcp=False,
+                                 num_ctx=b["num_ctx"], keep_alive=b["keep_alive"],
+                                 timeout=b["timeout"])
+
+    def _split(self, agent, topic: str, n: int, kind: str, *, emit=None) -> list:
+        prompt = (f"Break this topic into EXACTLY {n} distinct {kind}, each a short "
+                  f"specific phrase worth researching. Topic: {topic}\n\n"
+                  f"Reply with ONLY a numbered list (one item per line), no preamble.")
+        try:
+            reply = agent.run_task(prompt, on_event=emit) if emit else agent.run_task(prompt)
+        except Exception:  # noqa: BLE001
+            reply = ""
+        items = []
+        for ln in (reply or "").splitlines():
+            s = re.sub(r"^[\s\d.)\-*•]+", "", ln).strip()
+            if s:
+                items.append(s)
+        items = items[:n]
+        while len(items) < n:
+            items.append(f"{topic} — additional angle {len(items) + 1}")
+        return items
+
+    def _research_one(self, run: CrewRun, spec: str, topic: str, angle: str,
+                      idx: int, branch: str | None = None, branch_id=None, rnd=None):
+        # branch_id (the sub-area index, or None when flat) lets the tree nest each
+        # researcher under its sub-manager; rnd (looped runs) tags which round it ran in.
+        tag = {"role": "worker", "worker_id": idx, "branch": branch_id, "round": rnd}
+        run.emit({**tag, "type": "tool_call", "angle": angle[:120],
+                  "tool": "research", "args": {"angle": angle[:90]}})
+        agent = self._research_agent(spec, max_steps=6)
+        ctx = f"Overall topic: {topic}" + (f"\nSub-area: {branch}" if branch else "")
+        # Forceful + structured so small local models actually SEARCH and return
+        # specifics instead of generic prose (the main cause of weak local research).
+        task = ("Research the angle below and return SUBSTANTIVE findings — not generic advice.\n"
+                "STEP 1: Call web_search at least once with a focused query to get current, real info "
+                "(search again if the first results are thin).\n"
+                "STEP 2: Write 4-6 bullet points. Each MUST be a specific fact, number, tool name, "
+                "technique, or concrete trade-off you actually found — with a short source. "
+                "No vague filler like 'consider best practices'.\n"
+                "STEP 3: Finish with the 2-3 strongest, most actionable takeaways for the overall topic.\n"
+                "Do NOT write files or run shell commands.\n\n"
+                "Angle: " + angle)
+        emit = lambda e: run.emit({**e, **tag})
+        try:
+            out = agent.run_task(task, context=ctx, on_event=emit)
+        except Exception as exc:  # noqa: BLE001
+            out = f"(researcher error: {exc})"
+        run.emit({**tag, "type": "tool_result", "tool": "research", "result": f"✓ {angle[:70]}"})
+        return (angle, out)
+
+    def _synthesize(self, spec: str, topic: str, findings: list, *, master: bool = False,
+                    emit=None) -> str:
+        # Synthesis is PURE GENERATION — build a TOOL-LESS agent so a local model can't
+        # loop calling web_search and hit "max tool steps" (which produced empty reports).
+        what = "sub-area reports" if master else "researcher findings"
+
+        def _build(cap: int) -> tuple[str, str]:
+            joined = "\n\n".join(f"### {a}\n{(t or '').strip()[:cap]}" for a, t in findings)
+            prompt = (f"You are synthesizing {what} on: {topic}\n\n{joined}\n\n"
+                      f"Write a structured report in Markdown:\n"
+                      f"- A 1-2 sentence summary.\n"
+                      f"- '## Key findings' — the concrete, specific facts/numbers/tools from the "
+                      f"research above, DEDUPLICATED (merge repeats).\n"
+                      f"- '## Ranked recommendations' — best first, each a specific actionable item "
+                      f"with a one-line why.\n"
+                      f"Use the actual details from the findings; do NOT pad with generic advice "
+                      f"('follow best practices', 'it depends'). If the findings are thin, say so "
+                      f"briefly rather than inventing filler. Do not call any tools — just write it.")
+            return prompt, joined
+
+        is_local = not spec.startswith("claude:")
+        # A bare "(model error/(synthesis error" sentinel from run_task means the call
+        # failed (e.g. an Ollama 500 when 16k ctx on a 30B spills VRAM on 24GB). Local
+        # synthesis runs at a SAFE 8k ctx; on failure we retry smaller, then fall back
+        # to the raw findings so the user always gets a usable report — never an error.
+        def _bad(s: str) -> bool:
+            return (not s) or s.lstrip().startswith(("(model error", "(synthesis error"))
+
+        attempts = [(8192, 4000), (4096, 1500)] if is_local else [(None, 12000)]
+        last_joined = ""
+        for ctx, cap in attempts:
+            prompt, last_joined = _build(cap)
+            try:
+                if spec.startswith("claude:"):
+                    agent = agents.make_agent(spec, max_turns=2, disallowed_tools=_RESEARCH_BLOCK)
+                else:
+                    agent = agents.make_agent(spec, tool_names=[], max_steps=2, num_ctx=ctx)
+                out = agent.run_task(prompt, on_event=emit) if emit else agent.run_task(prompt)
+                if not _bad(out):
+                    return out
+            except Exception:  # noqa: BLE001
+                pass  # fall through to the next (smaller) attempt
+        # Every attempt failed — return the gathered findings directly so the run is
+        # still useful instead of a one-line error.
+        return (f"## Findings on: {topic}\n\n_(Automatic synthesis was unavailable — "
+                f"showing the raw researcher findings below.)_\n\n{last_joined}")
+
+    def _drive_research(self, run: CrewRun) -> None:
+        import concurrent.futures as cf
+        cfg = run.research_cfg
+        topic = run.goal
+        M, K = cfg["n_submanagers"], cfg["n_researchers"]
+        pool = 8  # bounded concurrent researchers (each spawns a model process)
+        # Role-tagged emitters so manager / sub-manager token usage surfaces in the
+        # tree just like the researchers' (worker_id keeps each node distinct;
+        # sub-managers use a high base to never collide with researcher indices).
+        mgr_emit = lambda e: run.emit({**e, "role": "manager"})
+        def ck():
+            if run._cancel:
+                raise _Cancelled()
+        try:
+            run.status = "planning"
+            manager = self._research_agent(run.manager_spec, max_steps=4, role="manager")
+            ck()
+
+            if M <= 0:  # flat
+                angles = self._split(manager, topic, K, "research angles", emit=mgr_emit)
+                ck()
+                run.emit({"type": "text", "role": "manager",
+                          "text": f"Dispatching {len(angles)} researchers: " + "; ".join(angles)})
+                run.status = "working"
+                findings = [None] * len(angles)
+                with cf.ThreadPoolExecutor(max_workers=min(pool, len(angles))) as ex:
+                    futs = {ex.submit(self._research_one, run, cfg["researcher_spec"],
+                                      topic, ang, i): i for i, ang in enumerate(angles)}
+                    for fut in cf.as_completed(futs):
+                        findings[futs[fut]] = fut.result()
+                        ck()
+                run.status = "reviewing"
+                run.emit({"type": "text", "role": "manager", "text": "Synthesizing & ranking…"})
+                run.final = self._synthesize(run.manager_spec, topic, findings, emit=mgr_emit)
+            else:  # tiered: manager -> sub-managers -> researchers
+                branches = self._split(manager, topic, M, "major sub-areas", emit=mgr_emit)
+                ck()
+                run.emit({"type": "text", "role": "manager",
+                          "text": f"{M} sub-managers × {K} researchers = {M * K} researchers. "
+                                  f"Sub-areas: " + "; ".join(branches)})
+                run.status = "working"
+                submgrs, tasks = [], []
+                for bi, br in enumerate(branches):
+                    sm = self._research_agent(cfg["submanager_spec"], max_steps=4, role="submanager")
+                    submgrs.append(sm)
+                    sm_emit = lambda e, b=bi: run.emit({**e, "role": "submanager",
+                                                        "worker_id": 1000 + b, "branch": b})
+                    for ang in self._split(sm, f"{topic} — sub-area: {br}", K,
+                                           "research angles", emit=sm_emit):
+                        tasks.append((bi, br, ang))
+                # surface each sub-area title so the tree can label sub-manager nodes
+                for bi, br in enumerate(branches):
+                    run.emit({"type": "branch", "role": "submanager",
+                              "worker_id": 1000 + bi, "branch": bi, "title": br})
+                by_branch: dict = {bi: [] for bi in range(len(branches))}
+                with cf.ThreadPoolExecutor(max_workers=pool) as ex:
+                    futs = {ex.submit(self._research_one, run, cfg["researcher_spec"],
+                                      topic, ang, i, br, bi): bi
+                            for i, (bi, br, ang) in enumerate(tasks)}
+                    for fut in cf.as_completed(futs):
+                        by_branch[futs[fut]].append(fut.result())
+                        ck()
+                run.status = "reviewing"
+                branch_reports = []
+                for bi, br in enumerate(branches):
+                    run.emit({"type": "text", "role": "submanager",
+                              "text": f"Sub-manager synthesizing: {br}"})
+                    sm_emit = lambda e, b=bi: run.emit({**e, "role": "submanager",
+                                                        "worker_id": 1000 + b, "branch": b})
+                    branch_reports.append(
+                        (br, self._synthesize(cfg["submanager_spec"], f"{topic} :: {br}",
+                                              by_branch[bi], emit=sm_emit)))
+                run.emit({"type": "text", "role": "manager", "text": "Master synthesis…"})
+                run.final = self._synthesize(run.manager_spec, topic, branch_reports,
+                                             master=True, emit=mgr_emit)
+            run.report_file = _save_report(run)
+            run.status = "done"
+        except _Cancelled:
+            run.emit({"type": "text", "role": "manager", "text": "Stopped by user."})
+            run.status = "cancelled"
+        except Exception as exc:  # noqa: BLE001
+            run.error = f"{type(exc).__name__}: {exc}"
+            run.emit({"type": "error", "text": run.error})
+            run.status = "error"
+        run.ended = time.time()
+
+    def _replan(self, agent, topic, findings, k, rnd, emit=None):
+        """Manager reviews findings and returns up to k NEW angles targeting the gaps,
+        or [] if it judges coverage sufficient (replies just DONE)."""
+        joined = "\n\n".join(f"- {a}: {str(t)[:300]}" for a, t in findings[-12:])
+        prompt = (f"You are leading a multi-round research effort on: {topic}\n\n"
+                  f"Findings so far (after round {rnd + 1}):\n{joined}\n\n"
+                  f"Decide the next step. If the topic is now well-covered, reply with EXACTLY the "
+                  f"single word DONE. Otherwise identify the most important REMAINING GAPS and reply "
+                  f"with EXACTLY {k} new, SPECIFIC research angles targeting those gaps — a numbered "
+                  f"list, one per line, no preamble. Do NOT repeat angles already covered.")
+        try:
+            reply = agent.run_task(prompt, on_event=emit) if emit else agent.run_task(prompt)
+        except Exception:  # noqa: BLE001
+            return []
+        if reply and re.search(r"\bDONE\b", reply) and len(reply.strip()) < 14:
+            return []
+        items = []
+        for ln in (reply or "").splitlines():
+            s = re.sub(r"^[\s\d.)\-*•]+", "", ln).strip()
+            if not s or len(s) <= 4:
+                continue
+            if s.endswith(":") or (s.isupper() and len(s) < 42):   # skip headers like "REMAINING GAPS:"
+                continue
+            items.append(s)
+        return items[:k]
+
+    def _drive_looped(self, run: CrewRun) -> None:
+        """Looped-Opus orchestrator (flat): the manager runs bounded ROUNDS, re-planning
+        on the researchers' findings each round, then synthesizes everything. Stop:
+        hard round cap (cfg.rounds) OR the manager declaring DONE early."""
+        import concurrent.futures as cf
+        cfg = run.research_cfg
+        topic = run.goal
+        K = cfg["n_researchers"]
+        rounds = cfg["rounds"]
+        pool = 8
+        mgr_emit = lambda e: run.emit({**e, "role": "manager"})
+        def ck():
+            if run._cancel:
+                raise _Cancelled()
+        try:
+            run.status = "planning"
+            manager = self._research_agent(run.manager_spec, max_steps=4, role="manager")
+            ck()
+            angles = self._split(manager, topic, K, "research angles", emit=mgr_emit)
+            all_findings, idx = [], 0
+            for rnd in range(rounds):
+                ck()
+                run.emit({"type": "text", "role": "manager", "round": rnd,
+                          "text": f"Round {rnd + 1}/{rounds}: {len(angles)} researchers — "
+                                  + "; ".join(a[:55] for a in angles)})
+                run.status = "working"
+                results = [None] * len(angles)
+                with cf.ThreadPoolExecutor(max_workers=min(pool, len(angles))) as ex:
+                    futs = {ex.submit(self._research_one, run, cfg["researcher_spec"],
+                                      topic, ang, idx + i, rnd=rnd): i for i, ang in enumerate(angles)}
+                    for fut in cf.as_completed(futs):
+                        results[futs[fut]] = fut.result(); ck()
+                idx += len(angles)
+                all_findings += [r for r in results if r]
+                if rnd >= rounds - 1:
+                    break
+                run.status = "reviewing"
+                run.emit({"type": "text", "role": "manager", "round": rnd,
+                          "text": "Reviewing findings & planning the next round…"})
+                angles = self._replan(manager, topic, all_findings, K, rnd, emit=mgr_emit)
+                if not angles:
+                    run.emit({"type": "text", "role": "manager",
+                              "text": "Manager judged coverage sufficient — stopping early."})
+                    break
+            ck()
+            run.status = "reviewing"
+            run.emit({"type": "text", "role": "manager", "text": "Final synthesis across all rounds…"})
+            run.final = self._synthesize(run.manager_spec, topic, all_findings, emit=mgr_emit)
+            run.report_file = _save_report(run)
+            run.status = "done"
+        except _Cancelled:
+            run.emit({"type": "text", "role": "manager", "text": "Stopped by user."})
+            run.status = "cancelled"
+        except Exception as exc:  # noqa: BLE001
+            run.error = f"{type(exc).__name__}: {exc}"
+            run.emit({"type": "error", "text": run.error})
+            run.status = "error"
+        run.ended = time.time()
 
     def get(self, run_id: str) -> CrewRun | None:
         return self.runs.get(run_id)
 
     def list(self) -> list:
+        # Incognito assistant runs are hidden from the runs list (leave no trace).
         return [r.to_dict() for r in sorted(self.runs.values(),
-                                            key=lambda r: r.created, reverse=True)]
+                                            key=lambda r: r.created, reverse=True)
+                if not getattr(r, "incognito", False)]
 
     def approve(self, run_id: str, approved: bool, note: str = "") -> bool:
         run = self.runs.get(run_id)
@@ -795,6 +1328,138 @@ class _CrewManager:
             run.emit({"type": "error", "text": run.error})
             self._finish(run, "error")
 
+    def _drive_loop(self, run: CrewRun) -> None:
+        """Looped AUTONOMOUS coder: plan → build (test-gated) → the manager reviews the
+        results + workspace and re-plans the next round (fix failures, fill gaps) in the
+        SAME folder, until all subtasks pass or the round cap. Auto-approved end-to-end.
+        This is the 'builds good things on its own' prototype."""
+        try:
+            rounds = max(1, run.code_rounds)
+            prev_fail = None   # stasis tracking: set of still-failing subtasks last round
+            for rnd in range(rounds):
+                run.emit({"type": "phase", "role": "manager", "round": rnd,
+                          "text": f"round {rnd + 1}/{rounds}"})
+                if run.support_researchers:
+                    self._gather_support(run, rnd)   # sub-agents research → run.research_notes
+                if run._cancel:
+                    return self._finish(run, "cancelled")
+                if rnd == 0:
+                    self._plan(run)
+                elif not self._replan_code(run, rnd):
+                    run.emit({"type": "phase", "role": "manager",
+                              "text": "manager: goal complete — finishing"})
+                    break
+                if run._cancel:
+                    return self._finish(run, "cancelled")
+                self._work(run)
+                if run._cancel:
+                    return self._finish(run, "cancelled")
+                self._verify_completeness(run)
+                if run._cancel:
+                    return self._finish(run, "cancelled")
+                if run.workers and all(w.status == "done" for w in run.workers):
+                    run.emit({"type": "phase", "role": "manager",
+                              "text": "all subtasks passed — finishing"})
+                    break
+                # STASIS: if a round ends with the EXACT same set of failing subtasks as
+                # the previous round, the loop isn't making progress — stop early instead
+                # of burning identical rounds (a worse model can spin here forever).
+                fail_sig = frozenset((w.title, w.status) for w in run.workers if w.status != "done")
+                if fail_sig and fail_sig == prev_fail and rnd < rounds - 1:
+                    run.emit({"type": "phase", "role": "manager",
+                              "text": "no progress since last round (identical failures) — stopping early"})
+                    break
+                prev_fail = fail_sig
+            self._coverage_review(run)
+            self._review(run)
+            self._finish(run, "done")
+        except Exception as exc:  # noqa: BLE001
+            run.error = f"{type(exc).__name__}: {exc}"
+            run.emit({"type": "error", "text": run.error})
+            self._finish(run, "error")
+
+    def _replan_code(self, run: CrewRun, rnd: int) -> bool:
+        """Manager reviews the prior round's outcomes + the workspace and produces the
+        NEXT round's plan, or returns False if the goal is complete (replies DONE)."""
+        lines = []
+        for w in run.workers:
+            gate = "PASS" if w.gate_passed is True else ("FAIL" if w.gate_passed is False else "manual/none")
+            # Structured failure context so the manager re-plans against the REAL error,
+            # not a 160-char truncation: name the check that ran + give fuller output.
+            acc = (w.acceptance if isinstance(w.acceptance, str)
+                   else "embedded tests" if w.acceptance is None else str(w.acceptance))
+            entry = f"- [{w.status}] {w.title} — gate {gate}"
+            if w.status != "done":
+                entry += f"\n    check: {acc}\n    output: {(w.output or '').strip()[:400] or '(none)'}"
+            else:
+                entry += f"; {(w.output or '')[:120]}"
+            lines.append(entry)
+        prev = "\n".join(lines) or "(nothing built yet)"
+        mgr = agents.make_agent(run.manager_spec,
+                                tool_names=run.manager_tools or _READONLY,
+                                max_steps=8, cwd=run.cwd)
+        prompt = (f"GOAL:\n{run.goal}\n\nThis is round {rnd + 1} of an iterative build. "
+                  f"Workspace: {run.cwd}\nPrior subtask results:\n{prev}\n\n"
+                  f"Inspect the existing files (list_dir / read_file) as needed. If the GOAL is now "
+                  f"fully met and tests pass, reply with EXACTLY the single word DONE. Otherwise produce "
+                  f"the NEXT plan — fix the failures and fill the gaps — in the SAME format (contract + "
+                  f"subtasks, each with owns + a runnable acceptance). Build on the existing files; do "
+                  f"NOT redo work that already passed."
+                  + (f"\n\nCURRENT RESEARCH (fresh, use it):\n{run.research_notes}" if run.research_notes else ""))
+        reply = mgr.run_task(prompt, system=_PLAN_SYS.format(maxw=run.max_workers),
+                             on_event=lambda e: run.emit({**e, "role": "manager"}))
+        if reply and re.search(r"\bDONE\b", reply) and len(reply.strip()) < 14:
+            return False
+        plan, contract = _parse_plan(reply, run.goal, run.max_workers)
+        if not plan:
+            return False
+        run.plan, run.contract = plan, contract
+        run.workers = [Worker(id=i, title=p["title"], detail=p["detail"],
+                              acceptance=p.get("acceptance"),
+                              check_rationale=p.get("check_rationale", ""),
+                              owns=p.get("owns", []))
+                       for i, p in enumerate(plan)]
+        run.emit({"type": "plan", "plan": run.plan, "contract": run.contract, "round": rnd})
+        return True
+
+    def _gather_support(self, run: CrewRun, rnd: int) -> None:
+        """Research-augmented build: sub-agent researchers gather current info for this
+        round (round 0 = the goal; later rounds = the open gaps/failures), and the joined
+        findings are stashed on run.research_notes → injected into the manager's plan AND
+        the builders' context so they work from fresh info, not just memory."""
+        import concurrent.futures as cf
+        n = run.support_researchers
+        spec = run.support_spec or run.worker_spec
+        mgr_emit = lambda e: run.emit({**e, "role": "manager"})
+        run.emit({"type": "phase", "role": "manager", "round": rnd,
+                  "text": f"researching ({n} agents) to inform the build…"})
+        focus = run.goal
+        if rnd > 0:
+            gaps = "; ".join(f"{w.title} [{w.status}]" for w in run.workers)
+            focus = f"{run.goal}\n\nOpen gaps/failures to research: {gaps}"
+        mgr = self._research_agent(run.manager_spec, max_steps=4, role="manager") \
+            if run.manager_spec.startswith("claude:") else agents.make_agent(
+                run.manager_spec, tool_names=_READONLY, max_steps=4)
+        try:
+            angles = self._split(mgr, focus, n, "concrete technical questions worth researching to build this well", emit=mgr_emit)
+        except Exception:  # noqa: BLE001
+            angles = [run.goal]
+        findings = []
+        try:
+            with cf.ThreadPoolExecutor(max_workers=min(8, len(angles))) as ex:
+                futs = [ex.submit(self._research_one, run, spec, run.goal, ang, 5000 + rnd * 100 + i, rnd=rnd)
+                        for i, ang in enumerate(angles)]
+                for f in cf.as_completed(futs):
+                    if run._cancel:
+                        break
+                    findings.append(f.result())
+        except Exception as exc:  # noqa: BLE001
+            run.emit({"type": "error", "text": f"support research: {exc}"})
+        notes = "\n\n".join(f"### {a}\n{str(t)[:600]}" for a, t in findings if t)
+        run.research_notes = notes[:6000]
+        run.emit({"type": "phase", "role": "manager",
+                  "text": f"research done — {len(findings)} findings feeding the build"})
+
     def _approver(self, run: CrewRun, worker_id: int):
         def approve(name: str, args: dict):
             # Auto-approve mode: run unattended — grant without pausing. (The
@@ -826,7 +1491,9 @@ class _CrewManager:
                                 tool_names=run.manager_tools or _READONLY,
                                 max_steps=8, cwd=run.cwd)
         sys_prompt = _PLAN_SYS.format(maxw=run.max_workers)
-        reply = mgr.run_task(run.goal, system=sys_prompt,
+        task = run.goal + (f"\n\nCURRENT RESEARCH (fresh, gathered for this build — use it):\n{run.research_notes}"
+                           if run.research_notes else "")
+        reply = mgr.run_task(task, system=sys_prompt,
                              on_event=lambda e: run.emit({**e, "role": "manager"}))
         run.plan, run.contract = _parse_plan(reply, run.goal, run.max_workers)
         run.workers = [Worker(id=i, title=p["title"], detail=p["detail"],
@@ -863,6 +1530,9 @@ class _CrewManager:
             context += ("\n\nSHARED CONTRACT — conform to these agreed interfaces "
                         "(filenames, signatures, conventions):\n"
                         + json.dumps(run.contract, indent=1)[:2000])
+        if run.research_notes:
+            context += ("\n\nRESEARCH (current info the team gathered for this build — "
+                        "prefer it over your own assumptions):\n" + run.research_notes[:3000])
         for w in run.workers:
             if run._cancel:
                 return
@@ -896,6 +1566,7 @@ class _CrewManager:
                             "SDK unavailable; running local", w.id)
             w.escalation_reason = ""   # fell back to local; drop the predict tag
             w.ran_on = "local"
+        prev_gate = None   # for stasis detection (#6): stop retrying on identical failures
         for attempt in range(1, MAX_REPAIR + 1):
             if run._cancel:
                 return
@@ -953,6 +1624,14 @@ class _CrewManager:
                 w.status = "done" if w.acceptance is not None else "unverified"
                 w.ended_at = time.time()
                 break
+            # STASIS (#6): the SAME failing gate output twice means the worker is stuck
+            # in a loop — retrying again just burns tokens. Stop and let it fail/escalate.
+            go = (gate_out or "").strip()
+            if attempt > 1 and go and go == prev_gate:
+                run.emit({"type": "phase", "worker_id": w.id,
+                          "text": f"worker {w.id} stalled — identical failure twice; stopping retries"})
+                break
+            prev_gate = go
 
         # Fell through all attempts without a terminal status -> failed the gate.
         if w.status not in ("done", "unverified", "error"):
@@ -1075,9 +1754,9 @@ class _CrewManager:
     def _verify_completeness(self, run: CrewRun) -> None:
         """COMPLETENESS PASS (local, honest): a subtask cannot be 'passed' if a
         deliverable it DECLARED (via `owns`) is missing, or an owned/expected test
-        was never RUN by a gate. Such a subtask is flagged UNVERIFIED (not passed)
-        with a clear reason. Conservative — it only checks what subtasks declared
-        they'd produce; it never invents requirements."""
+        was never RUN by a gate. Such a subtask is flagged UNVERIFIED (not passed),
+        and a local retry first TRIES to write the missing test. Conservative — it
+        only checks what subtasks declared they'd produce; never invents requirements."""
         run.emit({"type": "phase", "text": "completeness check"})
         if not run.cwd:
             return
@@ -1088,9 +1767,8 @@ class _CrewManager:
                 continue   # already worse than unverified — leave it
             issues = self._check_one(run, w)
             if issues and not run._cancel:
-                # STEP 2: try to fix it LOCALLY (write the missing test) before flagging.
-                self._retry_for_completeness(run, w, issues)
-                issues = self._check_one(run, w)   # re-check against the new files
+                self._retry_for_completeness(run, w, issues)   # local fix attempt
+                issues = self._check_one(run, w)               # re-check new files
             if issues:
                 w.incomplete_reason = "; ".join(issues)
                 if w.status == "done":
@@ -1104,8 +1782,7 @@ class _CrewManager:
                 run.emit({"type": "completeness", "worker_id": w.id, "status": "resolved"})
 
     def _check_one(self, run: CrewRun, w: "Worker") -> list:
-        """Fresh completeness check for one subtask (re-reads disk + gate state, so
-        it reflects any test a retry just wrote)."""
+        """Fresh completeness check for one subtask (re-reads disk + gate state)."""
         try:
             all_files = _all_rel_files(run.cwd)
         except OSError:
@@ -1118,13 +1795,11 @@ class _CrewManager:
         return self._completeness_issues(run, w, all_files, ran)
 
     def _retry_for_completeness(self, run: CrewRun, w: "Worker", issues: list) -> None:
-        """LOCAL retry (qwen fixes qwen — never Opus): re-dispatch the worker with
-        an augmented task to WRITE the missing test, then gate it. Bounded by
-        MAX_REPAIR; on give-up the caller leaves the subtask UNVERIFIED. Uses the
-        same agent/approver/gate/allowlist machinery as the work loop."""
+        """LOCAL retry (worker fixes its own gap — never Opus): re-dispatch the
+        worker to WRITE the missing test, then gate it. Bounded by MAX_REPAIR; on
+        give-up the caller leaves the subtask UNVERIFIED. Reuses the same agent /
+        approver / gate / allowlist machinery as the work loop."""
         steps = _STEP_BUDGET.get(run.complexity, 10)
-        # Let the worker write the test files for its own modules even if it only
-        # formally owned the module (still scoped to THIS subtask's test paths).
         owns = list(w.owns or [])
         extra = []
         for rel in list(owns):
@@ -1167,16 +1842,13 @@ class _CrewManager:
                 run.emit({"type": "error", "worker_id": w.id, "text": f"(retry error: {exc})"})
                 continue
             w.output = out
-            # Prefer the worker's stated gate (allowlist-validated — a smoke test is
-            # rejected, exactly like anywhere else); else re-run the existing command
-            # (covers the whole-suite case now that the new test exists).
             derived = _extract_acceptance_cmd(out)
             if derived and _is_allowed_acceptance_cmd(derived):
                 gate_cmd = derived
             elif isinstance(w.acceptance, str):
                 gate_cmd = w.acceptance
             else:
-                continue   # no runnable, allowlisted gate to verify with — try again
+                continue
             passed, gout = gate.run_gate(gate_cmd, run.cwd)
             run.emit({"type": "gate", "worker_id": w.id, "phase": "completeness",
                       "passed": passed, "output": gout[:600]})
@@ -1185,7 +1857,7 @@ class _CrewManager:
                 w.gate_passed = True
                 w.gate_output = gout
                 w.attempts += 1
-                return   # caller re-checks; if the test now ran, it's resolved
+                return
 
     def _completeness_issues(self, run: CrewRun, w: "Worker", all_files, ran) -> list:
         """The deliverable gaps for one subtask (empty list => complete)."""
@@ -1222,9 +1894,9 @@ class _CrewManager:
     def _coverage_review(self, run: CrewRun) -> None:
         """SPEC-COVERAGE REVIEW (best-effort, manager-driven): for each genuinely
         green subtask, have the manager critique whether the tests cover the spec's
-        named cases. Missing cases are recorded (Step 2 then retries to add them).
-        Degrades to a no-op when the manager can't critique (empty result) — it
-        NEVER fabricates failures and NEVER turns into a fake pass."""
+        named cases. Missing cases trigger a local retry (add them). Degrades to a
+        no-op when the manager can't critique (empty result) — NEVER fabricates a
+        failure and NEVER turns into a fake pass."""
         if not run.coverage_review or not run.cwd:
             return
         run.emit({"type": "phase", "text": "spec-coverage review"})
@@ -1239,7 +1911,7 @@ class _CrewManager:
             tests = [r for r in (w.owns or [])
                      if _is_test_name(Path(r).name) and (Path(run.cwd) / r).exists()]
             if not mods or not tests:
-                continue   # nothing to critique (no owned module+test pair on disk)
+                continue
             missing = self._critique_coverage(run, w, mods, tests)
             if missing:
                 w.coverage_missing = missing
@@ -1248,76 +1920,11 @@ class _CrewManager:
                             w.id, w.title, missing)
                 run.emit({"type": "coverage", "worker_id": w.id, "status": "missing",
                           "missing": missing})
-                self._retry_for_coverage(run, w, missing)   # STEP 2: add the cases + re-gate
+                self._retry_for_coverage(run, w, missing)
             else:
                 w.coverage_note = "coverage looks complete"
                 run.emit({"type": "coverage", "worker_id": w.id, "status": "complete",
                           "missing": []})
-
-    def _retry_for_coverage(self, run: CrewRun, w: "Worker", missing: list) -> None:
-        """LOCAL retry: add the missing spec cases to the TEST file(s) only — the
-        worker may NOT edit the module, so a genuine bug surfaces as a gate FAILURE
-        (the subtask becomes `failed` and names the real bug) instead of being
-        silently patched. If the added assertions pass, coverage improved, stays done."""
-        test_owns = [r for r in (w.owns or []) if _is_test_name(Path(r).name)
-                     and (Path(run.cwd) / r).exists()]
-        if not test_owns:
-            return   # no test file we can extend
-        steps = _STEP_BUDGET.get(run.complexity, 10)
-        cases = "; ".join(missing)
-        for attempt in range(1, MAX_REPAIR + 1):
-            if run._cancel:
-                return
-            run.emit({"type": "phase", "worker_id": w.id,
-                      "text": f"worker {w.id} · {w.title} · coverage retry "
-                              f"{attempt}/{MAX_REPAIR} (add missing spec cases)"})
-            agent = agents.make_agent(run.worker_spec, max_steps=steps, cwd=run.cwd,
-                                      use_mcp=run.worker_use_mcp,
-                                      tool_names=[n for n in toolmod.tool_names() if n != "launch_crew"],
-                                      owns=test_owns)   # TEST files only — module is off-limits
-            task = (f"Subtask: {w.title}\n\n{w.detail}\n\n"
-                    f"Your tests PASS but do NOT cover these spec-required cases: {cases}.\n"
-                    f"Add a pytest assertion for EACH missing case to the test file(s): "
-                    f"{', '.join(test_owns)}. Do NOT modify the module under test — only the "
-                    f"test file(s) (writes elsewhere are refused). Then make the LAST line of "
-                    f"your reply EXACTLY:\nACCEPTANCE_CMD: pytest <your_test_file> -q\n"
-                    f"a single pytest/unittest command — no shell chaining or `python -c` smoke tests.")
-            try:
-                out = agent.run_task(
-                    task, system=_WORKER_SYS, context=f"Overall goal:\n{run.goal}",
-                    on_event=lambda e, wid=w.id: run.emit({**e, "role": "worker", "worker_id": wid}),
-                    approver=self._approver(run, w.id))
-            except Exception as exc:  # noqa: BLE001
-                run.emit({"type": "error", "worker_id": w.id, "text": f"(coverage retry error: {exc})"})
-                continue
-            w.output = out
-            derived = _extract_acceptance_cmd(out)
-            if derived and _is_allowed_acceptance_cmd(derived):
-                gate_cmd = derived
-            elif isinstance(w.acceptance, str):
-                gate_cmd = w.acceptance
-            else:
-                continue   # worker gave no runnable gate yet — try again
-            passed, gout = gate.run_gate(gate_cmd, run.cwd)
-            run.emit({"type": "gate", "worker_id": w.id, "phase": "coverage",
-                      "passed": passed, "output": gout[:600]})
-            w.acceptance = gate_cmd
-            w.gate_output = gout
-            if passed:
-                w.gate_passed = True
-                w.coverage_note = "coverage gap fixed (added + passing): " + cases
-                run.emit({"type": "coverage", "worker_id": w.id, "status": "fixed",
-                          "missing": missing})
-            else:
-                # added assertion FAILED => a real bug on a spec-required case. Honest: fail.
-                w.gate_passed = False
-                w.status = "failed"
-                w.coverage_note = "REAL BUG surfaced by added coverage: " + cases
-                log.warning("coverage: subtask %d FAILED — real bug on spec case(s): %s",
-                            w.id, cases)
-                run.emit({"type": "coverage", "worker_id": w.id, "status": "bug-surfaced",
-                          "missing": missing})
-            return   # gate ran => decision made
 
     def _critique_coverage(self, run: CrewRun, w: "Worker", mods: list, tests: list) -> list:
         """Ask the manager which spec-required cases the tests omit. Conservative;
@@ -1350,6 +1957,70 @@ class _CrewManager:
         if not isinstance(missing, list):
             return []
         return [str(x).strip() for x in missing if str(x).strip()][:8]
+
+    def _retry_for_coverage(self, run: CrewRun, w: "Worker", missing: list) -> None:
+        """LOCAL retry: add the missing spec cases to the TEST file(s) only — the
+        worker may NOT edit the module, so a genuine bug surfaces as a gate FAILURE
+        (subtask becomes `failed` and names the real bug) instead of being silently
+        patched. If the added assertions pass, coverage improved, stays done."""
+        test_owns = [r for r in (w.owns or []) if _is_test_name(Path(r).name)
+                     and (Path(run.cwd) / r).exists()]
+        if not test_owns:
+            return
+        steps = _STEP_BUDGET.get(run.complexity, 10)
+        cases = "; ".join(missing)
+        for attempt in range(1, MAX_REPAIR + 1):
+            if run._cancel:
+                return
+            run.emit({"type": "phase", "worker_id": w.id,
+                      "text": f"worker {w.id} · {w.title} · coverage retry "
+                              f"{attempt}/{MAX_REPAIR} (add missing spec cases)"})
+            agent = agents.make_agent(run.worker_spec, max_steps=steps, cwd=run.cwd,
+                                      use_mcp=run.worker_use_mcp,
+                                      tool_names=[n for n in toolmod.tool_names() if n != "launch_crew"],
+                                      owns=test_owns)   # TEST files only — module off-limits
+            task = (f"Subtask: {w.title}\n\n{w.detail}\n\n"
+                    f"Your tests PASS but do NOT cover these spec-required cases: {cases}.\n"
+                    f"Add a pytest assertion for EACH missing case to the test file(s): "
+                    f"{', '.join(test_owns)}. Do NOT modify the module under test — only the "
+                    f"test file(s) (writes elsewhere are refused). Then make the LAST line of "
+                    f"your reply EXACTLY:\nACCEPTANCE_CMD: pytest <your_test_file> -q\n"
+                    f"a single pytest/unittest command — no shell chaining or `python -c` smoke tests.")
+            try:
+                out = agent.run_task(
+                    task, system=_WORKER_SYS, context=f"Overall goal:\n{run.goal}",
+                    on_event=lambda e, wid=w.id: run.emit({**e, "role": "worker", "worker_id": wid}),
+                    approver=self._approver(run, w.id))
+            except Exception as exc:  # noqa: BLE001
+                run.emit({"type": "error", "worker_id": w.id, "text": f"(coverage retry error: {exc})"})
+                continue
+            w.output = out
+            derived = _extract_acceptance_cmd(out)
+            if derived and _is_allowed_acceptance_cmd(derived):
+                gate_cmd = derived
+            elif isinstance(w.acceptance, str):
+                gate_cmd = w.acceptance
+            else:
+                continue
+            passed, gout = gate.run_gate(gate_cmd, run.cwd)
+            run.emit({"type": "gate", "worker_id": w.id, "phase": "coverage",
+                      "passed": passed, "output": gout[:600]})
+            w.acceptance = gate_cmd
+            w.gate_output = gout
+            if passed:
+                w.gate_passed = True
+                w.coverage_note = "coverage gap fixed (added + passing): " + cases
+                run.emit({"type": "coverage", "worker_id": w.id, "status": "fixed",
+                          "missing": missing})
+            else:
+                w.gate_passed = False
+                w.status = "failed"
+                w.coverage_note = "REAL BUG surfaced by added coverage: " + cases
+                log.warning("coverage: subtask %d FAILED — real bug on spec case(s): %s",
+                            w.id, cases)
+                run.emit({"type": "coverage", "worker_id": w.id, "status": "bug-surfaced",
+                          "missing": missing})
+            return
 
     def _review(self, run: CrewRun) -> None:
         run.status = "reviewing"

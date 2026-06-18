@@ -221,6 +221,22 @@ _reg(Tool("run_shell", "Run a shell command on this PC and return its output.",
           lambda command, cwd=None: _run_shell(command, cwd), danger=True))
 
 
+def _launch_crew(goal: str, manager: str = "", worker: str = "") -> str:
+    from . import crew   # lazy import to avoid a cycle (crew -> agents -> tools)
+    m = manager or "ollama:qwen3-coder:30b"
+    w = worker or m
+    run = crew.MANAGER.start(goal, manager_spec=m, worker_spec=w)
+    return f"Launched crew run {run.id} (manager={m}, worker={w}) for: {goal[:100]}"
+
+
+_reg(Tool("launch_crew", "Launch an autonomous coder-crew run to build something (a manager "
+                         "plans, workers implement + test). manager/worker are optional agent specs.",
+          {"type": "object", "properties": {"goal": {"type": "string"},
+                                             "manager": {"type": "string"},
+                                             "worker": {"type": "string"}}, "required": ["goal"]},
+          lambda goal, manager="", worker="": _launch_crew(goal, manager, worker), danger=True))
+
+
 # --- public API --------------------------------------------------------------
 def schemas(names: list[str] | None = None) -> list[dict]:
     """Tool schemas to hand to the model. `names` filters; None = all."""

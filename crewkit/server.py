@@ -146,6 +146,117 @@ def crew_start(req: StartRequest) -> JSONResponse:
     return JSONResponse({"run_id": run.id})
 
 
+class ResearchRequest(BaseModel):
+    topic: str
+    manager: str = "claude:claude-opus-4-8"
+    submanager: str = "claude:sonnet"
+    researcher: str = "claude:haiku"
+    n_submanagers: int = 0       # 0 = flat (manager -> researchers)
+    n_researchers: int = 6       # researchers (per sub-manager when tiered)
+    rounds: int = 1              # >1 = looped: manager re-plans across rounds
+
+
+@app.post("/api/crew/research")
+def crew_research(req: ResearchRequest) -> JSONResponse:
+    """Research swarm: a manager fans the topic out to researchers (and optionally
+    sub-managers), then synthesizes + ranks. rounds>1 loops, re-planning on gaps."""
+    if not req.topic.strip():
+        raise HTTPException(status_code=400, detail="A topic is required.")
+    run = crew.MANAGER.start_research(
+        req.topic.strip(), manager_spec=req.manager,
+        submanager_spec=req.submanager, researcher_spec=req.researcher,
+        n_submanagers=req.n_submanagers, n_researchers=req.n_researchers,
+        rounds=req.rounds)
+    return JSONResponse({"run_id": run.id})
+
+
+class AutopilotRequest(BaseModel):
+    idea: str
+    build: bool | None = None    # None = let the planner decide research vs build
+    manager: str = "claude:claude-opus-4-8"
+    researcher: str = "claude:haiku"
+    builder: str = "ollama:qwen3-coder:30b"
+
+
+@app.post("/api/crew/autopilot")
+def crew_autopilot(req: AutopilotRequest) -> JSONResponse:
+    """One prompt -> a planner sizes the whole pipeline (research vs build,
+    #researchers, rounds) and launches it."""
+    if not req.idea.strip():
+        raise HTTPException(status_code=400, detail="Describe what you want.")
+    run = crew.MANAGER.autopilot(req.idea.strip(), manager_spec=req.manager,
+                                 researcher_spec=req.researcher, builder_spec=req.builder,
+                                 build=req.build)
+    return JSONResponse({"run_id": run.id})
+
+
+class AssistantRequest(BaseModel):
+    text: str
+    model: str | None = None
+    history: list[dict] | None = None
+    incognito: bool = False
+
+
+@app.post("/api/assistant/send")
+def assistant_send(req: AssistantRequest) -> JSONResponse:
+    """The conversational coding assistant as a tool-using agent. Returns a run_id;
+    the UI polls /api/crew/runs/{id} for activity + approvals (shared gate)."""
+    if not req.text.strip():
+        raise HTTPException(status_code=400, detail="Empty message.")
+    spec = req.model or "ollama:qwen2.5:7b-instruct"
+    run = crew.MANAGER.start_assistant(req.text.strip(), spec, req.history or [],
+                                       incognito=req.incognito)
+    return JSONResponse({"run_id": run.id})
+
+
+# --- local Ollama chat (assistant model picker + private chat) --------------
+@app.get("/api/chat/status")
+def chat_status() -> dict:
+    return {"available": chat.available(), "host": getattr(chat, "OLLAMA", "")}
+
+
+@app.get("/api/chat/models")
+def chat_models() -> dict:
+    try:
+        return {"models": chat.models()}
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"Ollama unreachable: {exc}")
+
+
+class ChatRequest(BaseModel):
+    model: str
+    messages: list[dict]
+
+
+@app.post("/api/chat/send")
+def chat_send(req: ChatRequest) -> JSONResponse:
+    if not req.model:
+        raise HTTPException(status_code=400, detail="No model selected.")
+    return JSONResponse(chat.chat(req.model, req.messages))
+
+
+@app.post("/api/chat/start")
+def chat_start() -> dict:
+    try:
+        return chat.start_daemon()
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "message": str(exc)}
+
+
+class EnhanceRequest(BaseModel):
+    text: str
+    model: str = ""
+
+
+@app.post("/api/crew/enhance")
+def crew_enhance(req: EnhanceRequest) -> JSONResponse:
+    """Rewrite a rough Create idea into a sharper prompt, on the chosen model."""
+    if not req.text.strip():
+        raise HTTPException(status_code=400, detail="Nothing to improve.")
+    spec = req.model or "ollama:qwen2.5:7b-instruct"
+    return JSONResponse({"prompt": crew.enhance_prompt(req.text.strip(), spec)})
+
+
 @app.get("/api/crew/runs")
 def crew_runs() -> dict:
     return {"runs": crew.MANAGER.list()}
