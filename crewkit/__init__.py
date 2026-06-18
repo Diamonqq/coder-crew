@@ -7,4 +7,4 @@ a runnable acceptance gate, and the manager reviews + integrates the result.
 Local-first (Ollama). Optional opt-in escalation of a failed/unverifiable subtask
 to Claude/Opus via claude-agent-sdk (OFF by default).
 """
-__version__ = "0.2.0"
+__version__ = "0.2.1"

@@ -132,7 +132,7 @@ def _web_search(query: str) -> str:
             html = resp.read(800_000).decode("utf-8", errors="replace")
     except Exception as exc:  # noqa: BLE001
         return f"Search failed: {exc}"
-    results = []
+    hits = []
     for m in re.finditer(r'result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>', html):
         href, title = m.group(1), re.sub(r"<[^>]+>", "", m.group(2)).strip()
         href = urllib.parse.unquote(href)
@@ -142,9 +142,17 @@ def _web_search(query: str) -> str:
             except Exception:  # noqa: BLE001
                 pass
         if title:
-            results.append(f"- {title}\n  {href}")
-        if len(results) >= 8:
+            hits.append([title, href, ""])
+        if len(hits) >= 8:
             break
+    # Pair each result with its snippet (DDG serves them in order) so the model gets
+    # actual CONTENT, not just titles — real findings vs guessing from headlines.
+    snips = [re.sub(r"<[^>]+>", "", m.group(1)).strip()
+             for m in re.finditer(r'result__snippet"[^>]*>(.*?)</a>', html, re.S)]
+    for i, h in enumerate(hits):
+        if i < len(snips) and snips[i]:
+            h[2] = snips[i][:300]
+    results = [f"- {t}\n  {u}" + (f"\n  {s}" if s else "") for t, u, s in hits]
     return "\n".join(results) if results else "No results."
 
 

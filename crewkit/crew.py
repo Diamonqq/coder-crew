@@ -1007,7 +1007,7 @@ class _CrewManager:
         stuck leaf fails fast instead of hanging the swarm). Ignored for Claude."""
         budgets = {"manager":    {"num_ctx": 16384, "keep_alive": "20m", "timeout": 600.0},
                    "submanager": {"num_ctx": 8192,  "keep_alive": "5m",  "timeout": 300.0},
-                   "researcher": {"num_ctx": 4096,  "keep_alive": "60s", "timeout": 180.0}}
+                   "researcher": {"num_ctx": 8192,  "keep_alive": "60s", "timeout": 300.0}}
         b = budgets.get(role, budgets["researcher"])
         if spec.startswith("claude:"):
             return agents.make_agent(spec, max_turns=max_steps,
@@ -1042,17 +1042,19 @@ class _CrewManager:
         tag = {"role": "worker", "worker_id": idx, "branch": branch_id, "round": rnd}
         run.emit({**tag, "type": "tool_call", "angle": angle[:120],
                   "tool": "research", "args": {"angle": angle[:90]}})
-        agent = self._research_agent(spec, max_steps=6)
+        agent = self._research_agent(spec, max_steps=8)
         ctx = f"Overall topic: {topic}" + (f"\nSub-area: {branch}" if branch else "")
         # Forceful + structured so small local models actually SEARCH and return
         # specifics instead of generic prose (the main cause of weak local research).
         task = ("Research the angle below and return SUBSTANTIVE findings — not generic advice.\n"
-                "STEP 1: Call web_search at least once with a focused query to get current, real info "
-                "(search again if the first results are thin).\n"
-                "STEP 2: Write 4-6 bullet points. Each MUST be a specific fact, number, tool name, "
-                "technique, or concrete trade-off you actually found — with a short source. "
+                "STEP 1: web_search a focused query.\n"
+                "STEP 2: web_fetch the 2 MOST PROMISING result URLs and READ them. Do not write "
+                "findings from search titles/snippets alone — open the pages and pull real detail. "
+                "(Fetch a different result if one is junk/blocked.)\n"
+                "STEP 3: Write 4-6 bullet points, each a SPECIFIC fact, number, tool name, version, "
+                "command, or concrete trade-off you read in the fetched pages — cite which source. "
                 "No vague filler like 'consider best practices'.\n"
-                "STEP 3: Finish with the 2-3 strongest, most actionable takeaways for the overall topic.\n"
+                "STEP 4: Finish with the 2-3 strongest, most actionable takeaways for the overall topic.\n"
                 "Do NOT write files or run shell commands.\n\n"
                 "Angle: " + angle)
         emit = lambda e: run.emit({**e, **tag})
@@ -1071,16 +1073,18 @@ class _CrewManager:
 
         def _build(cap: int) -> tuple[str, str]:
             joined = "\n\n".join(f"### {a}\n{(t or '').strip()[:cap]}" for a, t in findings)
-            prompt = (f"You are synthesizing {what} on: {topic}\n\n{joined}\n\n"
-                      f"Write a structured report in Markdown:\n"
-                      f"- A 1-2 sentence summary.\n"
-                      f"- '## Key findings' — the concrete, specific facts/numbers/tools from the "
-                      f"research above, DEDUPLICATED (merge repeats).\n"
-                      f"- '## Ranked recommendations' — best first, each a specific actionable item "
-                      f"with a one-line why.\n"
-                      f"Use the actual details from the findings; do NOT pad with generic advice "
-                      f"('follow best practices', 'it depends'). If the findings are thin, say so "
-                      f"briefly rather than inventing filler. Do not call any tools — just write it.")
+            prompt = (f"Write a THOROUGH research report synthesizing {what} on: {topic}\n\n{joined}\n\n"
+                      f"Markdown. DO NOT over-compress — keep the substance:\n"
+                      f"- A short overview (2-4 sentences).\n"
+                      f"- '## Findings' organized into a few themed subsections (use '### ' headers). "
+                      f"Under each, list EVERY distinct concrete point from the research — facts, numbers, "
+                      f"versions, commands, tools, trade-offs — each with a brief source. Merge only true "
+                      f"duplicates; do NOT drop real detail just to be brief.\n"
+                      f"- '## Recommendations' — ranked best-first, each specific + actionable with a one-line why.\n"
+                      f"- '## Caveats / open questions' — anything conflicting, uncertain, or unverified in the sources.\n"
+                      f"Use the ACTUAL details from the findings; never pad with generic advice "
+                      f"('follow best practices', 'it depends'). If the research is genuinely thin, say so. "
+                      f"Do not call any tools — just write the full report.")
             return prompt, joined
 
         is_local = not spec.startswith("claude:")
@@ -1091,7 +1095,10 @@ class _CrewManager:
         def _bad(s: str) -> bool:
             return (not s) or s.lstrip().startswith(("(model error", "(synthesis error"))
 
-        attempts = [(8192, 4000), (4096, 1500)] if is_local else [(None, 12000)]
+        # Bigger ctx + per-finding cap so MORE research reaches the synthesizer and it
+        # can write a fuller report. 16k fits a 7B head or a ~26B MoE head; falls back
+        # smaller on failure.
+        attempts = [(16384, 8000), (8192, 4000)] if is_local else [(None, 16000)]
         last_joined = ""
         for ctx, cap in attempts:
             prompt, last_joined = _build(cap)
