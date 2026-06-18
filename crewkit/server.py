@@ -203,7 +203,7 @@ def assistant_send(req: AssistantRequest) -> JSONResponse:
     the UI polls /api/crew/runs/{id} for activity + approvals (shared gate)."""
     if not req.text.strip():
         raise HTTPException(status_code=400, detail="Empty message.")
-    spec = req.model or "ollama:qwen2.5:7b-instruct"
+    spec = req.model or "ollama:qwen3-coder:30b"
     run = crew.MANAGER.start_assistant(req.text.strip(), spec, req.history or [],
                                        incognito=req.incognito)
     return JSONResponse({"run_id": run.id})
@@ -253,7 +253,7 @@ def crew_enhance(req: EnhanceRequest) -> JSONResponse:
     """Rewrite a rough Create idea into a sharper prompt, on the chosen model."""
     if not req.text.strip():
         raise HTTPException(status_code=400, detail="Nothing to improve.")
-    spec = req.model or "ollama:qwen2.5:7b-instruct"
+    spec = req.model or "ollama:qwen3-coder:30b"
     return JSONResponse({"prompt": crew.enhance_prompt(req.text.strip(), spec)})
 
 

@@ -573,18 +573,6 @@
   .saved-row:hover{border-color:var(--amber)}
   .saved-row .sr-nm{flex:1;font-size:12px;color:var(--ink);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .saved-row .sr-meta{font-family:var(--mono);font-size:10px;color:var(--ink-faint);flex:none}
-  /* code scan */
-  .scan-find{border:1px solid var(--line);border-left:3px solid var(--line);border-radius:8px;padding:8px 10px;margin-bottom:6px}
-  .scan-find.sf-real{border-left-color:var(--bad)}
-  .scan-find.sf-false{border-left-color:var(--ink-faint);opacity:.55}
-  .scan-find .sf-top{display:flex;gap:8px;align-items:center;font-family:var(--mono);font-size:10px}
-  .scan-find .sf-rule{color:var(--amber)}
-  .scan-find .sf-loc{color:var(--ink-faint)}
-  .scan-find .sf-tag{margin-left:auto;font-size:9px;text-transform:uppercase;letter-spacing:.06em;padding:1px 6px;border-radius:5px;background:var(--panel-2);color:var(--ink-faint)}
-  .scan-find.sf-real .sf-tag{background:#3a1c1c;color:var(--bad)}
-  .scan-find .sf-msg{font-size:11.5px;color:var(--ink-dim);margin-top:3px}
-  .scan-find .sf-reason{font-size:10.5px;color:var(--ink-faint);margin-top:3px;font-style:italic}
-  #scan-out{max-height:420px;overflow:auto;margin-top:8px}
   /* crew history */
   .crew-sub-head{font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:var(--ink-faint);
     margin:18px 0 8px;border-top:1px solid var(--line);padding-top:14px}
@@ -2236,7 +2224,7 @@ function openNewProject(){
   m.innerHTML=`<div class="modal"><div class="modal-head"><h3>+ New Project</h3><button class="x" onclick="closeNP()">✕</button></div>
     <div class="modal-body">
       <label>Name<input id="np-name" type="text" placeholder="my-project" autocomplete="off"></label>
-      <label>Folder<input id="np-path" type="text" placeholder="D:\\Kiwi\\my-project" autocomplete="off"></label>
+      <label>Folder<input id="np-path" type="text" placeholder="/path/to/project" autocomplete="off"></label>
       <label class="np-check"><input id="np-create" type="checkbox"> create this folder if it doesn't exist</label>
       <label>First prompt<textarea id="np-prompt" placeholder="What should the head agent do first?"></textarea></label>
       <div class="np-row">
@@ -2635,7 +2623,7 @@ function buildCrew(){
         <button class="primary" id="crew-go" onclick="crewStart()">Launch ▸</button>
       </div>
       <label style="display:block;margin-top:10px;font-size:11px;color:var(--ink-dim)">Working folder (optional — needed for file/shell coding tasks)
-        <input id="crew-cwd" type="text" placeholder="D:\\Kiwi\\my-project" autocomplete="off" style="margin-top:4px"></label>
+        <input id="crew-cwd" type="text" placeholder="/path/to/project" autocomplete="off" style="margin-top:4px"></label>
       <label class="toggle warn" title="Off = everything runs local. On = concurrency subtasks route to Opus upfront, and any local subtask that fails/can't self-verify escalates to Opus. Uses paid Opus.">
         <input id="crew-escalate" type="checkbox"><span class="track"></span>
         <span>Allow Opus escalation (paid) — predict-route concurrency + escalate local failures</span></label>
@@ -2643,17 +2631,6 @@ function buildCrew(){
         <input id="crew-autoapprove" type="checkbox"><span class="track"></span>
         <span>Auto-approve tools — run unattended (no per-step approval)</span></label>
       <div class="crew-hint" id="crew-status"></div>
-    </div>
-    <div class="crew-setup" style="margin-top:14px">
-      <div style="font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:var(--ink-faint);margin-bottom:10px">
-        🛡 Code scan · ruff security ruleset → LLM false-positive filter</div>
-      <div class="crew-roles">
-        <div class="ctl" style="flex:2"><label>Folder or file to scan</label><input id="scan-path" type="text" placeholder="D:\\Kiwi\\my-project" autocomplete="off"></div>
-        <div class="ctl"><label>Judge model</label><select id="scan-model"></select></div>
-        <button class="primary" id="scan-go" onclick="scanRun()">🛡 Scan ▸</button>
-      </div>
-      <div class="crew-hint" id="scan-status"></div>
-      <div id="scan-out"></div>
     </div>
     <div id="crew-projects"></div>
     <div id="crew-runs"></div>
@@ -2720,20 +2697,19 @@ async function crewRefreshConfig(){
   pick($("#rs-sub"),"manager","claude:sonnet");
   // Prompt-enhancer model picker — default to a fast small local model.
   pick($("#rs-enh-model"),"worker",
-       ready("ollama:huihui_ai/qwen2.5-abliterate:7b")?"ollama:huihui_ai/qwen2.5-abliterate:7b":"ollama:qwen2.5:7b-instruct");
+       ready("ollama:qwen2.5:7b-instruct")?"ollama:qwen2.5:7b-instruct":"ollama:qwen3-coder:30b");
   if($("#rs-mgr")){ setPreset(_createPreset); }   // apply Local/Claude preset to the selects
   // Tools tab — coder crew form (if present)
   const mgr=$("#crew-mgr"), wkr=$("#crew-wkr"), st=$("#crew-status");
   if(mgr){
     pick(mgr,"manager",ready(cfg.defaults.manager)?cfg.defaults.manager:"");
     pick(wkr,"worker",ready(cfg.defaults.worker)?cfg.defaults.worker:"");
-    pick($("#crew-research"),"worker", ready("ollama:huihui_ai/qwen2.5-abliterate:7b")?"ollama:huihui_ai/qwen2.5-abliterate:7b":"ollama:qwen2.5:7b-instruct");
+    pick($("#crew-research"),"worker", ready("ollama:qwen2.5:7b-instruct")?"ollama:qwen2.5:7b-instruct":"ollama:qwen3-coder:30b");
     if(st){ const missing=(cfg.ollama_roles||[]).filter(r=>!r.ready).map(r=>r.label.split(" — ")[0]);
       let msg=cfg.ollama_available?"Ollama online.":"⚠ Ollama offline.";
       if(missing.length) msg+=` Not downloaded: ${missing.join(", ")}.`;
       st.innerHTML=msg; }
   }
-  pick($("#scan-model"),"worker", ready("ollama:qwen3-coder:30b")?"ollama:qwen3-coder:30b":"");
   loadCrewProjects();
 }
 function rsEstimate(){
@@ -2809,10 +2785,12 @@ function setPreset(p){
     // HEAD/manager = a GENERAL instruct model (plans + synthesizes far better than a
     // coder). Prefers a 32B general if you've pulled one, else the 7B-instruct. The
     // BUILDER stays the coder — that's what it's good at.
-    setFirst('#rs-mgr',['ollama:qwen2.5:32b-instruct','ollama:qwen2.5:7b-instruct','ollama:huihui_ai/qwen2.5-abliterate:7b','ollama:huihui_ai/qwen3-coder-abliterated:30b']);
-    setFirst('#rs-wkr',['ollama:huihui_ai/qwen2.5-abliterate:7b','ollama:qwen2.5:7b-instruct','ollama:qwen3:4b']);
-    setFirst('#rs-builder',['ollama:huihui_ai/qwen3-coder-abliterated:30b','ollama:qwen3-coder:30b']);
-    setFirst('#rs-sub',['ollama:qwen2.5:7b-instruct','ollama:huihui_ai/qwen2.5-abliterate:7b']);
+    // HEAD/manager = a general instruct model (better at synthesis/planning than a
+    // coder); BUILDER stays the coder. All stock builds (pick whatever you've pulled).
+    setFirst('#rs-mgr',['ollama:qwen2.5:32b-instruct','ollama:qwen2.5:7b-instruct','ollama:qwen3-coder:30b']);
+    setFirst('#rs-wkr',['ollama:qwen2.5:7b-instruct','ollama:qwen3:4b','ollama:qwen3-coder:30b']);
+    setFirst('#rs-builder',['ollama:qwen3-coder:30b']);
+    setFirst('#rs-sub',['ollama:qwen2.5:7b-instruct','ollama:qwen3-coder:30b']);
   } else {
     setFirst('#rs-mgr',['claude:claude-opus-4-8']);
     setFirst('#rs-wkr',['claude:haiku']);
@@ -3352,35 +3330,6 @@ function toggleDl(ev){ ev?.stopPropagation();
   if(!open){ _dlMenuAway=()=>closeDl(); setTimeout(()=>document.addEventListener("click",_dlMenuAway,{once:true}),0); } }
 function closeDl(){ $("#dl-menu")?.classList.add("hidden"); }
 
-async function scanRun(){
-  const path=$("#scan-path").value.trim();
-  if(!path){ alert("Enter a folder or file to scan."); return; }
-  const model=$("#scan-model").value||null;
-  const go=$("#scan-go"); go.disabled=true; go.textContent="…";
-  $("#scan-status").textContent="Scanning + LLM triage (may take a bit)…";
-  let res; try{ res=await post("/api/scan",{path, model, do_filter:!!model}); }
-  catch(e){ $("#scan-status").textContent="Scan failed."; go.disabled=false; go.textContent="🛡 Scan ▸"; return; }
-  go.disabled=false; go.textContent="🛡 Scan ▸"; renderScan(res);
-}
-function renderScan(res){
-  const st=$("#scan-status"), out=$("#scan-out"); if(!st) return;
-  if(!res.ok){ st.textContent="⚠ "+(res.error||"scan error"); out.innerHTML=""; return; }
-  const s=res.summary||{};
-  st.innerHTML=`${esc(res.scanner||"scan")} · <b>${s.total}</b> findings`+
-    ((s.real||s.false)?` · <span style="color:var(--bad)">${s.real} real</span> · <span style="color:var(--ink-faint)">${s.false} false-positive</span>${s.unjudged?` · ${s.unjudged} other`:""}`:"");
-  const order={real:0,false_positive:2};
-  const fs=(res.findings||[]).slice().sort((a,b)=>(order[a.verdict]??1)-(order[b.verdict]??1));
-  out.innerHTML = fs.length ? fs.map(f=>{
-    const v=f.verdict, cls=v==="real"?"sf-real":v==="false_positive"?"sf-false":"";
-    const tag=v==="real"?"REAL":v==="false_positive"?"false-pos":"";
-    return `<div class="scan-find ${cls}">
-      <div class="sf-top"><span class="sf-rule">${esc(f.rule)}</span>
-        <span class="sf-loc">${esc((f.file||"").split(/[\\\/]/).pop())}:${f.line||"?"}</span>
-        ${tag?`<span class="sf-tag">${tag}</span>`:""}</div>
-      <div class="sf-msg">${esc(f.message||"")}</div>
-      ${f.reason?`<div class="sf-reason">⚖ ${esc(f.reason)}</div>`:""}</div>`;
-  }).join("") : `<div class="tl-step tl-dim">No findings — clean. 🎉</div>`;
-}
 async function crewStart(){
   const goal=$("#crew-goal").value.trim();
   if(!goal){ alert("Describe a goal first."); return; }

@@ -35,6 +35,26 @@ Honesty about the boundary is the whole point:
   This is the honest boundary, and it's the differentiator — unverified work is
   surfaced as `unverified`/`failed`, never dressed up as a pass.
 
+## Also included: research swarm + assistant
+
+Two more local-first surfaces alongside the coder crew:
+
+- **Research swarm** — a manager model fans a topic out to parallel researcher
+  agents (web search + read, **strictly read-only** — no file writes, no shell),
+  then synthesizes and ranks the findings into a report you can read as a document
+  or slides and export (Markdown / HTML / PDF / CSV). Flat, or tiered with
+  sub-managers for broad topics.
+- **Assistant** — a conversational, tool-using agent for quick help: it can read/
+  write files, run shell, search the web, and `launch_crew` — every dangerous tool
+  going through the **same approval gate** as the crew.
+
+> **⚠ The research feature is NOT verified.** Unlike the coder crew, research has
+> **no verification gate** — its synthesis is never checked for correctness, and it
+> can confidently state wrong things or cite weak/irrelevant sources with nothing to
+> catch it. The coder crew's gate proves *tests ran*; it says nothing about whether
+> a research claim is *true*. **Treat research output as an aid and verify the
+> claims and sources yourself.**
+
 ## Why it's different
 
 - **Acceptance-gated, not vibes.** Every subtask carries a runnable check
