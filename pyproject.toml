@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "coder-crew"
+version = "1.0.0"
+description = "A local-first agentic coding crew: a manager plans, workers implement with real tools, every subtask is checked by a runnable acceptance gate, and unverified work is surfaced — never dressed up as a pass."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+authors = [{ name = "Diamonqq" }]
+keywords = ["agents", "llm", "ollama", "code-generation", "local-first"]
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+    "Intended Audience :: Developers",
+]
+dependencies = [
+    "fastapi>=0.110",
+    "uvicorn>=0.29",
+]
+
+[project.optional-dependencies]
+# Opus escalation (the local-vs-Opus auto-router). Without it the crew runs fully
+# local and allow_escalation just no-ops.
+escalation = ["claude-agent-sdk"]
+# MCP tool servers (fetch / git / time) exposed to the crew.
+mcp = ["mcp", "mcp-server-fetch", "mcp-server-git", "mcp-server-time"]
+
+[project.urls]
+Homepage = "https://github.com/Diamonqq/coder-crew"
+
+[project.scripts]
+coder-crew = "crewkit.server:main"
+
+[tool.setuptools]
+packages = ["crewkit", "crewkit.swarm"]
+
+[tool.setuptools.package-data]
+crewkit = ["../web/index.html"]

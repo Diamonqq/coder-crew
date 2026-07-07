@@ -1,0 +1,18 @@
+{
+  "_comment": "Optional local config (copy to config.json — gitignored). The app also writes the 'claude' section here when you Save in the Connection panel.",
+
+  "claude": {
+    "_comment": "How the optional Claude/Opus path authenticates. mode: off | code | api. 'code' = your logged-in `claude` CLI (subscription); 'api' = use api_key as ANTHROPIC_API_KEY.",
+    "mode": "code",
+    "model": "claude-opus-4-8",
+    "api_key": ""
+  },
+
+  "mcp_servers": {
+    "example-fs": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "."],
+      "disabled": true
+    }
+  }
+}

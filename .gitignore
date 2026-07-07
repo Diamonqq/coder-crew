@@ -1,0 +1,34 @@
+# python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# runtime data (incl. SQLite WAL/shm sidecars)
+crew_history.db*
+swarm_queue.db*
+*.db-wal
+*.db-shm
+crew-workspace/
+*.log
+
+# dev verification scratch (manual checks, not a shipped test suite)
+crewkit/swarm/_verify_*.py
+
+# PyInstaller build artifacts (the exe is shipped as a release asset, not committed)
+dist/
+build/
+*.spec
+
+# local config (may hold tokens / machine-specific paths / MCP server env)
+config.json
+
+# os / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# port backups
+_portbak-*/
